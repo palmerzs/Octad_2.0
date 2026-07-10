@@ -1,0 +1,473 @@
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(stringr); library(tibble); library(tidyr)
+  library(DESeq2); library(rhdf5); library(purrr); library(readxl)
+})
+
+# ==============================================================================
+# SECTION 0: CONFIGURATION (User-Editable)
+# ==============================================================================
+# TODO: Update these paths for your specific environment or move to a config file
+CONFIG <- list(
+  meta_file = "C:/Documents/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Mouse_Signature_Metadata_Formatted.xlsx",
+  archs4_h5 = "C:/Documents/science/ChenLab/mouse_gene_v2.latest.h5",
+  out_dir   = "C:/Documents/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/All_DE_Signatures"
+)
+
+# ==============================================================================
+# SECTION 1: USER-PROVIDED HELPER FUNCTIONS
+# (Formatting/Loading Logic for Backup Files & DESeq Execution)
+# ==============================================================================
+
+detect_delim <- function(path) {
+  first <- readr::read_lines(path, n_max = 1)
+  if (length(first) == 0) return("\t")
+  counts <- c(tab = str_count(first, "\t"), comma= str_count(first, ","), 
+              semi = str_count(first, ";"), pipe = str_count(first, "\\|"))
+  dlm <- names(which.max(counts))
+  switch(dlm, tab = "\t", comma= ",", semi = ";", pipe = "|", "\t")
+}
+
+safe_read_counts <- function(path, gene_col = 1) {
+  delim <- detect_delim(path)
+  message(sprintf("Reading %s (detected delimiter: '%s')", basename(path), if (delim == "\t") "\\t" else delim))
+  
+  df <- readr::read_delim(path, delim = delim, guess_max = 100000, show_col_types = FALSE)
+  
+  # Handle gene column dplyr::selection
+  if (is.numeric(gene_col)) gene_col <- names(df)[gene_col]
+  
+  # Clean and format
+  df <- df %>%
+    dplyr::mutate(!!gene_col := as.character(.data[[gene_col]])) %>%
+    dplyr::distinct(.data[[gene_col]], .keep_all = TRUE) %>%
+    dplyr::relocate(dplyr::all_of(gene_col))
+  
+  df2 <- as.data.frame(df, check.names = FALSE)
+  rownames(df2) <- df2[[gene_col]]
+  df2[[gene_col]] <- NULL
+  
+  # Force numeric
+  df2[] <- lapply(df2, function(x) suppressWarnings(as.numeric(x)))
+  
+  # [VERBOSE] Confirm dimensions loaded
+  message(sprintf("   -> [VERBOSE] Successfully loaded count matrix: %d genes x %d samples", nrow(df2), ncol(df2)))
+  
+  return(df2)
+}
+
+make_coldata <- function(sample_names, cases, controls, gse_id) {
+  all_labs <- c(controls, cases)
+  # Intersection check to allow for flexible ordering
+  valid_samples <- sample_names[sample_names %in% all_labs]
+  
+  condition <- factor(ifelse(valid_samples %in% cases, "case",
+                             ifelse(valid_samples %in% controls, "control", NA)),
+                      levels = c("control", "case"))
+  
+  # [VERBOSE] Confirm group balance
+  n_case <- sum(condition == "case", na.rm = TRUE)
+  n_ctrl <- sum(condition == "control", na.rm = TRUE)
+  message(sprintf("   -> [VERBOSE] Coldata constructed. Matched Samples: %d (Cases: %d | Controls: %d)", 
+                  length(valid_samples), n_case, n_ctrl))
+  
+  tibble(sample = valid_samples, condition = condition, GSE_ID = gse_id)
+}
+
+# ------------------------------------------------------------------------------
+# NEW: RIGOROUS QC FUNCTION
+# Implements filtering criteria from the referenced paper
+# ------------------------------------------------------------------------------
+apply_rigorous_qc <- function(counts) {
+  
+  message(sprintf("   -> [VERBOSE] Starting QC on matrix with %d genes x %d samples", nrow(counts), ncol(counts)))
+
+  # 1. Sample QC: Exclude samples with > 80% zero gene counts
+  #    (Prevents empty/failed libraries from skewing the model)
+  zero_prop <- colMeans(counts == 0, na.rm = TRUE)
+  keep_samples <- zero_prop <= 0.80
+  
+  if (sum(!keep_samples) > 0) {
+    message(sprintf("   -> [QC] Dropping %d sample(s) with >80%% zero counts.", sum(!keep_samples)))
+    counts <- counts[, keep_samples, drop = FALSE]
+  } else {
+    message("   -> [VERBOSE] No samples failed Zero-Count QC.")
+  }
+  
+  # 2. Gene QC: Exclude lowly expressed genes (CPM < 1 in < 2 samples)
+  #    Calculated manually to avoid edgeR dependency
+  #    Formula: (count / total_counts_in_sample) * 1,000,000
+ # cpm <- t(t(counts) / colSums(counts, na.rm=TRUE)) * 1e6
+  
+  # Keep genes where at least 2 samples have CPM >= 1
+  #keep_genes <- rowSums(cpm >= 1, na.rm = TRUE) >= 2
+  
+ # message(sprintf("   -> [QC] Filtering low expression genes: Keeping %d / %d genes.", sum(keep_genes), nrow(counts)))
+  #counts <- counts[keep_genes, , drop = FALSE]
+  
+  message(sprintf("   -> [VERBOSE] Final QC Matrix: %d genes x %d samples", nrow(counts), ncol(counts)))
+  
+  return(counts)
+}
+
+run_deseq_single <- function(counts, coldata, gene_id_type = "ensembl", gse_id = NA_character_,
+                             out_prefix = "DESeq2_result", alpha = 0.05) {
+  
+  # Alignment check
+  common <- intersect(colnames(counts), coldata$sample)
+  message(sprintf("   -> [VERBOSE] Intersection Check: %d samples found in both counts and metadata.", length(common)))
+
+  if (length(common) < 4) stop("Fewer than 4 overlapping samples (need >=2 per group).")
+  
+  # Subset counts and coldata to match exactly
+  counts <- counts[, common, drop = FALSE]
+  coldata <- coldata %>% 
+    dplyr::filter(sample %in% common) %>% 
+    dplyr::arrange(match(sample, colnames(counts)))
+  
+  # Basic sanity
+  if (dplyr::n_distinct(coldata$condition) < 2) stop("Both 'control' and 'case' must be present.")
+  
+  # --- NEW: Apply Rigorous QC (Sample & Gene Filtering) ---
+  counts_qc <- apply_rigorous_qc(counts)
+  
+  # Re-check samples/genes after QC
+  common_post_qc <- intersect(colnames(counts_qc), coldata$sample)
+  if(length(common_post_qc) < 4) stop("Too many samples failed QC (< 4 remaining).")
+  
+  counts_qc <- counts_qc[, common_post_qc, drop = FALSE]
+  coldata <- coldata %>% dplyr::filter(sample %in% common_post_qc)
+  
+  # --- CAPTURE SAMPLE SIZES (Crucial for Meta-Analysis) ---
+  n_controls <- sum(coldata$condition == "control")
+  n_cases    <- sum(coldata$condition == "case")
+  message(sprintf("   -> [VERBOSE] Final Model Configuration: %d Cases vs %d Controls", n_cases, n_controls))
+  
+  # Run DESeq2
+  message("   -> [VERBOSE] initializing DESeqDataSet...")
+  dds <- DESeqDataSetFromMatrix(countData = round(counts_qc),
+                                colData = as.data.frame(coldata),
+                                design = ~ condition)
+  
+  message("   -> [VERBOSE] Running DESeq() main function...")
+  dds <- DESeq(dds, quiet = TRUE)
+  
+  # Results
+  res <- results(dds, alpha = alpha, contrast = c("condition", "case", "control"))
+  
+  # Shrinkage (apeglm with fallback)
+  message("   -> [VERBOSE] Performing LFC Shrinkage...")
+  shrink_name <- resultsNames(dds)[grepl("condition_case_vs_control", resultsNames(dds))]
+  res_shrunk <- tryCatch({
+    suppressPackageStartupMessages({ library(apeglm) })
+    lfcShrink(dds, coef = shrink_name, type = "apeglm", quiet = TRUE)
+  }, error = function(e) {
+    message("   -> apeglm failed/missing, falling back to 'normal'.")
+    lfcShrink(dds, coef = shrink_name, type = "normal", quiet = TRUE)
+  })
+  
+  # Merge and Format
+  res_merged <- as.data.frame(res) %>%
+    rownames_to_column("gene_id") %>%
+    as_tibble() %>%
+    dplyr::mutate(
+      GSE_ID = gse_id, 
+      gene_id_type = gene_id_type,
+      # Add sample counts for meta-analysis weighting/df calculation
+      n_controls = n_controls,
+      n_cases = n_cases
+    ) %>%
+    dplyr::left_join(
+      as.data.frame(res_shrunk) %>% 
+        rownames_to_column("gene_id") %>% 
+        dplyr::select(gene_id, log2FoldChange_shrunk = log2FoldChange, lfcSE_shrunk = lfcSE),
+      by = "gene_id"
+    ) %>%
+    # --- NEW: Bound Standard Errors & Calculate Variance for REML ---
+    dplyr::mutate(
+      lfcSE_bounded = pmax(0.001, pmin(lfcSE_shrunk, 10)),
+      lfcVar_bounded = lfcSE_bounded^2  # Explicit variance for metafor::rma(vi = ...)
+    ) %>%
+    dplyr::arrange(padj)
+  
+  # Save
+  out_dir <- dirname(out_prefix)
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  message(sprintf("   -> [VERBOSE] Writing results to: %s_DESeq2_results.csv", basename(out_prefix)))
+  write_csv(res_merged, paste0(out_prefix, "_DESeq2_results.csv"))
+  
+  # Return data for summary
+  list(results = res_merged)
+}
+
+# ==============================================================================
+# SECTION 2: DATA PREPARATION
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. LOAD METADATA
+# ------------------------------------------------------------------------------
+message(paste("Reading Main Metadata from:", CONFIG$meta_file))
+meta <- read_excel(CONFIG$meta_file)
+
+# 1. Load ARCHS4 Indices ONCE
+message("Loading ARCHS4 master indices...")
+archs4_samples <- trimws(h5read(CONFIG$archs4_h5, "meta/samples/geo_accession"))
+archs4_genes   <- h5read(CONFIG$archs4_h5, "meta/genes")$symbol
+
+# 2. Transform 'meta' (samples) into 'job_list' (signatures)
+job_list <- meta %>%
+  # Ensure we know where data comes from
+  dplyr::mutate(in_archs4 = Sample_ID %in% archs4_samples) %>% 
+  dplyr::group_by(Key) %>%
+  dplyr::summarise(
+    # FIX: Use dplyr::first to avoid S4Vectors conflict
+    gse_id = dplyr::first(gse_id),
+    path = dplyr::first(path),
+    gene_col = dplyr::first(gene_col),
+    gene_id_type = dplyr::first(gene_id_type),
+    
+    # LOGIC UPDATE: Determine source
+    data_source = ifelse(any(in_archs4), "ARCHS4", "BACKUP"), 
+    
+    # *** CRITICAL FIX HERE ***
+    # If the source is BACKUP, grab 'Sample_ID_backup'. If ARCHS4, grab 'Sample_ID'.
+    cases = list(
+      if(unique(data_source) == "BACKUP") {
+        Sample_ID_backup[Group_Type == "Case"]
+      } else {
+        Sample_ID[Group_Type == "Case"]
+      }
+    ),
+    
+    controls = list(
+      if(unique(data_source) == "BACKUP") {
+        Sample_ID_backup[Group_Type == "Control"]
+      } else {
+        Sample_ID[Group_Type == "Control"]
+      }
+    ),
+    .groups = "drop"
+  )
+
+message(paste("Prepared job list for", nrow(job_list), "signatures."))
+print(table(job_list$data_source))
+
+# ==============================================================================
+# SECTION 3: THE UNIFIED GRAND LOOP
+# ==============================================================================
+
+if (!dir.exists(CONFIG$out_dir)) dir.create(CONFIG$out_dir, recursive = TRUE)
+
+results_summary <- list()
+
+for (i in 1:nrow(job_list)) {
+  job <- job_list[i, ]
+  
+  # Define Output Prefix
+  out_prefix <- file.path(CONFIG$out_dir, job$Key)
+  
+  # Skip if done
+  if (file.exists(paste0(out_prefix, "_DESeq2_results.csv"))) {
+    message(sprintf("[%d/%d] Skipping %s (Results exist)", i, nrow(job_list), job$Key))
+    next
+  }
+  
+  message(sprintf("\n[%d/%d] Processing %s | Source: %s", i, nrow(job_list), job$Key, job$data_source))
+  
+  # ERROR HANDLING WRAPPER
+  tryCatch({
+    
+    # ----------------------------------------------------
+    # BRANCH 1: ARCHS4 EXTRACTION (Updated for Partials)
+    # ----------------------------------------------------
+    if (job$data_source == "ARCHS4") {
+      message("   -> [VERBOSE] Branch: ARCHS4 Extraction")
+      
+      # 1. Identify which samples we WANTED vs which we HAVE
+      wanted_samples <- c(unlist(job$cases), unlist(job$controls))
+      
+      # Intersect finds only the samples that actually exist in the master list
+      # This effectively drops the "missing" GSM from the request list
+      valid_samples <- intersect(wanted_samples, archs4_samples)
+      
+      # Sanity Check: Did we lose too many?
+      if (length(valid_samples) < length(wanted_samples)) {
+        lost <- setdiff(wanted_samples, valid_samples)
+        message(paste("   -> Note: Dropping", length(lost), "missing sample(s) from ARCHS4 query:", paste(lost, collapse=", ")))
+      }
+      
+      # 2. Get Indices for valid samples only
+      idx <- match(valid_samples, archs4_samples)
+      
+      # 3. Extract
+      message(sprintf("   -> [VERBOSE] Extracting data from H5 for %d samples...", length(valid_samples)))
+      subset_counts <- h5read(CONFIG$archs4_h5, "data/expression", 
+                              index = list(idx, 1:length(archs4_genes)))
+      
+      # 4. Format
+      cnts <- t(subset_counts)
+      rownames(cnts) <- archs4_genes
+      colnames(cnts) <- valid_samples # Use valid_samples, not wanted_samples
+      
+      # 5. Prepare metadata
+      # make_coldata will handle the fact that 'colnames(cnts)' is smaller than 'cases/controls' lists
+      coldata <- make_coldata(colnames(cnts), unlist(job$cases), unlist(job$controls), job$gse_id)
+      
+      # 6. Run Analysis
+      res <- run_deseq_single(cnts, coldata, 
+                              gene_id_type = "symbol", 
+                              gse_id = job$gse_id, 
+                              out_prefix = out_prefix)
+      results_summary[[job$Key]] <- res$results
+      
+    # ----------------------------------------------------
+    # BRANCH 2: BACKUP FILE READING
+    # ----------------------------------------------------
+    } else {
+      message("   -> [VERBOSE] Branch: Backup File Read")
+      
+      # Read File
+      cnts <- safe_read_counts(job$path, gene_col = job$gene_col)
+      
+      # Validate Samples Exist
+      wanted <- c(unlist(job$cases), unlist(job$controls))
+      missing <- setdiff(wanted, colnames(cnts))
+      
+      # For backup files, we are stricter: if samples are missing here, the file might be wrong.
+      if (length(missing) > 0) {
+        stop(paste("Samples missing from backup file:", paste(missing, collapse=", ")))
+      }
+      
+      # Subset
+      cnts <- cnts[, wanted, drop = FALSE]
+      
+      # Prepare metadata
+      coldata <- make_coldata(colnames(cnts), unlist(job$cases), unlist(job$controls), job$gse_id)
+      
+      # Run Analysis
+      res <- run_deseq_single(cnts, coldata, 
+                              gene_id_type = job$gene_id_type, 
+                              gse_id = job$gse_id, 
+                              out_prefix = out_prefix)
+      results_summary[[job$Key]] <- res$results
+    }
+    
+  }, error = function(e) {
+    message(paste("   !!! ERROR processing Key:", job$Key))
+    message(paste("   !!! Message:", e$message))
+  })
+}
+
+# ==============================================================================
+# SECTION 4: SUMMARY
+# ==============================================================================
+
+message("\n--- Pipeline Complete ---")
+# Optional: Print simple summary if any results were generated in this session
+if(length(results_summary) > 0) {
+  final_summary <- map_dfr(results_summary, function(x) {
+    x %>% dplyr::summarize(
+        GSE_ID = unique(GSE_ID)[1],
+        total_genes = dplyr::n(),
+        sig_padj05 = sum(padj < 0.05, na.rm = TRUE)
+      )
+  }, .id = "Key")
+  
+  print(final_summary)
+}
+
+
+
+# --- Gene ID Standardization Script (Case-Insensitive Fix) ---
+
+# 1. LOAD REQUIRED LIBRARIES
+suppressPackageStartupMessages(library(tidyverse))
+
+# 2. DEFINE FILE PATHS
+input_dir    <- "C:\\Documents\\science\\ChenLab\\semaglutide_project\\Full_Survey_Semaglutide\\All_DE_Signatures"
+output_dir   <- "C:\\Documents\\science\\ChenLab\\semaglutide_project\\Full_Survey_Semaglutide\\DE_signatures_Standardized"
+mapping_file <- "C:\\Documents\\science\\ChenLab\\mouse_human_gene_mapping.csv"
+
+# 3. CREATE OUTPUT DIRECTORY
+if (!dir.exists(output_dir)) dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 4. LOAD GENE MAPPING FILE
+cat("Loading gene mapping file...\n")
+gene_map <- read_csv(mapping_file, show_col_types = FALSE) %>%
+  dplyr::rename(
+    Mouse_Ensembl = ensembl_gene_id,
+    Mouse_Symbol = external_gene_name,
+    Human_Ensembl = hsapiens_homolog_ensembl_gene,
+    Human_Symbol = hsapiens_homolog_associated_gene_name
+  ) %>%
+  dplyr::select(Mouse_Symbol, Mouse_Ensembl, Human_Symbol, Human_Ensembl) %>%
+  distinct() %>%
+  # *** FIX 1: Create a normalized Uppercase column for matching ***
+  mutate(Mouse_Symbol_Upper = toupper(Mouse_Symbol))
+
+# 5. LIST INPUT FILES
+files_to_process <- list.files(
+  path = input_dir,
+  pattern = "_DESeq2_results.csv$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+cat(paste("Found", length(files_to_process), "files to process.\n"))
+
+# 6. PROCESS EACH FILE
+for (file_path in files_to_process) {
+  
+  file_name <- basename(file_path)
+  cat(paste("Processing:", file_name, "...\n"))
+  
+  # Read results
+  deseq_results <- read_csv(file_path, show_col_types = FALSE)
+  
+  # Save original column names (excluding gene_id)
+  original_cols <- names(deseq_results)[names(deseq_results) != "gene_id"]
+  
+  # --- Gene ID Detection and Mapping ---
+  
+  # 6a. Process rows where gene_id is a Mouse Symbol (Case-Insensitive)
+  symbol_rows <- deseq_results %>%
+    dplyr::filter(!grepl("^ENSMUSG", gene_id)) %>%
+    # *** FIX 2: Normalize input ID to uppercase for matching ***
+    dplyr::mutate(Mouse_Symbol_Upper = toupper(gene_id)) %>%
+    # Join using the UPPERCASE columns
+    dplyr::left_join(gene_map, by = "Mouse_Symbol_Upper") %>%
+    # If the map provided a "proper" Mouse Symbol (Title Case), use it.
+    # Otherwise, fallback to the original gene_id.
+    dplyr::mutate(Mouse_Symbol = coalesce(Mouse_Symbol, gene_id))
+    
+  # 6b. Process rows where gene_id is a Mouse Ensembl ID
+  ensembl_rows <- deseq_results %>%
+    dplyr::filter(grepl("^ENSMUSG", gene_id)) %>%
+    dplyr::mutate(Mouse_Ensembl = gene_id) %>%
+    # Join by Ensembl ID (standard join)
+    dplyr::left_join(gene_map, by = "Mouse_Ensembl") %>%
+    # Remove the extra uppercase column coming from gene_map (we don't need it here)
+    dplyr::select(-any_of("Mouse_Symbol_Upper"))
+    
+  # 6c. Recombine
+  final_results <- dplyr::bind_rows(symbol_rows, ensembl_rows)
+  
+  # 6d. Reorder columns and drop the temporary helper column
+  final_results <- final_results %>%
+    dplyr::select(
+      gene_id, 
+      Mouse_Symbol,
+      Mouse_Ensembl,
+      Human_Symbol,
+      Human_Ensembl,
+      all_of(original_cols)
+    )
+    
+  # 7. WRITE
+  output_file_path <- file.path(output_dir, file_name)
+  write_csv(final_results, output_file_path)
+}
+
+cat("\n--- All files processed and standardized successfully. ---\n")
+
