@@ -1,7 +1,7 @@
 
 #this script standardizes the signatures into the format expected in all downstream steps. Joining non-mouse signatures may be performed here so long as they are tables with columns of the same names in the same output directory. 
 
-#This script also depends on a biomart mapping file. That file can be found on the github for download.
+#This script also depends on a biomart mapping file. That 'mouse_human_gene_mapping.csv' file can be found on the github for download.
 
 
 # --- Gene ID Standardization Script (Case-Insensitive Fix) ---
