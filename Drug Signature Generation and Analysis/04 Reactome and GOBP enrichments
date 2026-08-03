@@ -1,0 +1,399 @@
+
+
+# ==============================================================================
+# MODULE: CUSTOM MODULAR GSEA PIPELINE (REFACTORED - REACTOME & GOBP)
+# ==============================================================================
+# 1. Fetch Reactome & GOBP directly from MSigDB.
+# 2. Run GSEA on Semaglutide signatures (Parallelized).
+# 3. Generate Fixed-Aspect Heatmaps (Top 50 Most Significant).
+# ==============================================================================
+
+# --- Dependencies ---
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse, fgsea, msigdbr, pheatmap, ggrepel, 
+  readxl, doParallel, foreach, fs, grid
+)
+
+# --- Global Configuration ---
+CONFIG <- list(
+  # Paths, relative to PROJECT_ROOT
+  project_root = PROJECT_ROOT,
+  input_dir    = file.path("de_signatures_standardized"),
+  output_dir   = file.path("reactome_gobp_gsea"),
+  meta_file    = file.path("Mouse_Signature_Metadata_Formatted.xlsx"),
+
+  # Analysis Parameters
+  n_cores      = max(1, parallel::detectCores() - 2),
+  seed         = 42,
+  min_set_size = 10,
+  max_set_size = 500
+)
+# Construct full paths safely
+CONFIG$input_path  <- path(CONFIG$project_root, CONFIG$input_dir)
+CONFIG$output_path <- path(CONFIG$project_root, CONFIG$output_dir)
+CONFIG$meta_path   <- path(CONFIG$project_root, CONFIG$meta_file)
+
+# Create output directory
+if (!dir_exists(CONFIG$output_path)) dir_create(CONFIG$output_path, recurse = TRUE)
+
+# --- Helper Functions ---
+
+log_msg <- function(msg, type = "INFO") {
+  timestamp <- format(Sys.time(), "%H:%M:%S")
+  cat(sprintf("[%s] [%s] %s\n", timestamp, type, msg))
+}
+
+#' Extract clean sample name from filename
+get_sample_name <- function(fname) {
+  fname %>%
+    basename() %>%
+    str_remove("_DESeq2_results.csv") %>%
+    str_remove("Meta_Signature_") %>%
+    str_remove("_Full_Stats.csv") %>%
+    str_remove("_Consensus")
+}
+
+#' Run GSEA on a single dataframe
+run_single_sample_gsea <- function(file_path, pathways_list, seed = 42) {
+  
+  # 1. Read Data
+  df <- read_csv(file_path, show_col_types = FALSE)
+  
+  # 2. Determine Ranking Metric
+  rank_df <- NULL
+  if ("Pooled_LFC" %in% names(df)) {
+    rank_df <- df %>% mutate(rank_metric = as.numeric(Pooled_LFC))
+  } else if ("stat" %in% names(df)) {
+    rank_df <- df %>% mutate(rank_metric = as.numeric(stat))
+  } else if ("log2FoldChange_shrunk" %in% names(df)) {
+    rank_df <- df %>% mutate(rank_metric = as.numeric(log2FoldChange_shrunk))
+  } else if ("log2FoldChange" %in% names(df)) {
+    rank_df <- df %>% mutate(rank_metric = as.numeric(log2FoldChange))
+  }
+  
+  if (is.null(rank_df)) stop("No valid metric columns found.")
+  
+  # 3. Determine Gene Symbol
+  if ("Human_Symbol" %in% names(df)) {
+    rank_df <- rank_df %>% mutate(symbol = toupper(Human_Symbol))
+  } else if ("Gene" %in% names(df)) {
+    rank_df <- rank_df %>% mutate(symbol = toupper(Gene))
+  } else {
+    stop("No valid Gene Symbol column found.")
+  }
+  
+  # 4. Prepare Rank Vector
+  gene_ranks <- rank_df %>%
+    filter(!is.na(symbol), !is.na(rank_metric)) %>%
+    group_by(symbol) %>%
+    slice_max(order_by = abs(rank_metric), n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    dplyr::select(symbol, rank_metric) %>%
+    deframe()
+  
+  gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+  
+  # 5. Run FGSEA
+  set.seed(seed)
+  gsea_res <- fgsea(
+    pathways = pathways_list,
+    stats    = gene_ranks,
+    minSize  = CONFIG$min_set_size,
+    maxSize  = CONFIG$max_set_size,
+    nproc    = 1
+  )
+  
+  if (nrow(gsea_res) > 0) {
+    return(gsea_res %>% rowwise() %>% mutate(leadingEdge = paste(leadingEdge, collapse = "; ")))
+  } else {
+    return(NULL)
+  }
+}
+
+# ==============================================================================
+# PART 1: PREPARATION
+# ==============================================================================
+
+log_msg("--- Starting Pipeline ---")
+
+# 1. Load MSigDB (Reactome & GOBP)
+log_msg("Fetching Reactome and GOBP from MSigDB...")
+
+# Fetch Reactome
+m_reactome <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME") %>% 
+  mutate(Module_Name = "Reactome")
+
+# Fetch GOBP
+m_gobp <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP") %>% 
+  mutate(Module_Name = "GOBP")
+
+# Combine
+msig_db <- bind_rows(m_reactome, m_gobp)
+pathways_list <- split(msig_db$gene_symbol, msig_db$gs_name)
+
+# Create Module Info (Generic mapping for plotting groups)
+module_info <- msig_db %>% 
+  dplyr::select(pathway = gs_name, Module_Name) %>% 
+  distinct()
+
+log_msg(sprintf("Loaded %d Reactome and %d GOBP pathways.", 
+                length(unique(m_reactome$gs_name)), 
+                length(unique(m_gobp$gs_name))))
+
+# --- Load Metadata & Reconstruct Columns ---
+debug_print("Loading Metadata and Defining Cohorts...")
+raw_meta <- read_excel(META_FILE)
+
+# Prepare Tissue Mapping for Heatmap Annotations
+tissue_map_df <- raw_meta %>%
+  dplyr::group_by(Key) %>%
+  dplyr::summarise(
+    Raw_Tissue = dplyr::first(tissue),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    Tissue = ifelse(grepl("brain", Raw_Tissue, ignore.case = TRUE), "Brain", Raw_Tissue)
+  ) %>%
+  dplyr::select(Key, Tissue)
+
+# Reconstruct Cohort Study List
+study_list <- raw_meta %>%
+  dplyr::group_by(Key) %>%
+  dplyr::summarise(
+    Perturbation = unique(perturbation[Group_Type == "Case"])[1],
+    Tissue       = dplyr::first(tissue),
+    Species      = unique(species[Group_Type == "Case"])[1],
+    .groups      = "drop"
+  ) %>%
+  dplyr::filter(grepl("Semaglutide", Perturbation, ignore.case = TRUE)) %>%
+  dplyr::mutate(
+    Species = str_to_title(Species),
+    Tissue_Grouped = ifelse(grepl("brain", Tissue, ignore.case = TRUE), "Brain", Tissue),
+    Is_Pancreas = grepl("Pancreatic Neoplastic Lesion", Tissue, ignore.case = TRUE),
+    Is_Chen = grepl("chen", Key, ignore.case = TRUE)
+  )
+
+
+# Define Cohorts
+cohorts <- list()
+cohorts[["All_SansPancreas"]] <- study_list %>% dplyr::filter(!Is_Pancreas) %>% dplyr::pull(Key)
+cohorts[["Mouse_All"]]         <- study_list %>% dplyr::filter(species == "Mouse", !Is_Pancreas) %>% dplyr::pull(Key)
+cohorts[["Mouse_Liver"]]      <- study_list %>% dplyr::filter(species == "Mouse", grepl("Liver", Tissue_Grouped, ignore.case = TRUE)) %>% dplyr::pull(Key)
+cohorts[["All_Liver"]]        <- study_list %>% dplyr::filter(grepl("Liver", Tissue_Grouped, ignore.case = TRUE)) %>% dplyr::pull(Key)
+cohorts[["Mouse_Brain"]]      <- study_list %>% dplyr::filter(species == "Mouse", Tissue_Grouped == "Brain") %>% dplyr::pull(Key)
+cohorts[["All_Brain"]]        <- study_list %>% dplyr::filter(Tissue_Grouped == "Brain") %>% dplyr::pull(Key)
+cohorts[["Rat_All"]]          <- study_list %>% dplyr::filter(species == "Rat") %>% dplyr::pull(Key)
+cohorts[["Chen_Lab"]]         <- study_list %>% dplyr::filter(Is_Chen) %>% dplyr::pull(Key)
+
+# ==============================================================================
+# PART 2: PARALLEL EXECUTION (SPLIT DATABASE FIX)
+# ==============================================================================
+
+# 1. Split the Gene Sets for Independent Adjustment
+# We rely on the names in 'pathways_list' (REACTOME_... and GOBP_...)
+reactome_gs <- pathways_list[grep("REACTOME_", names(pathways_list))]
+gobp_gs     <- pathways_list[grep("GOBP_", names(pathways_list))]
+
+log_msg(sprintf("Split Analysis Prepared: %d REACTOME vs %d GOBP pathways.", 
+                length(reactome_gs), length(gobp_gs)))
+
+all_files <- dir_ls(CONFIG$input_path, glob = "*.csv")
+relevant_keys <- unique(unlist(cohorts))
+
+files_to_process <- all_files[map_lgl(all_files, function(f) {
+  k <- get_sample_name(f)
+  (k %in% relevant_keys) || grepl("Meta_Signature", basename(f))
+})]
+
+log_msg(sprintf("Launching parallel GSEA on %d files using %d cores...", length(files_to_process), CONFIG$n_cores))
+
+cl <- makeCluster(CONFIG$n_cores)
+registerDoParallel(cl)
+# Export the specific lists so the workers can see them
+clusterExport(cl, c("CONFIG", "run_single_sample_gsea", "reactome_gs", "gobp_gs", "get_sample_name"))
+
+parallel_logs <- foreach(
+  file_path = files_to_process,
+  .packages = c("tidyverse", "fgsea", "fs"), 
+  .combine = 'c'
+) %dopar% {
+  
+  sample_name <- get_sample_name(file_path)
+  out_file <- path(CONFIG$output_path, paste0(sample_name, "_GSEA_Module_results.csv"))
+  
+  if (file_exists(out_file)) {
+    return(paste0(sample_name, ": SKIP (Exists)"))
+  }
+  
+  tryCatch({
+    # --- RUN 1: REACTOME ONLY (Independent FDR) ---
+    res_reactome <- run_single_sample_gsea(file_path, reactome_gs, seed = CONFIG$seed)
+    if(!is.null(res_reactome)) {
+      res_reactome <- res_reactome %>% mutate(Source = "REACTOME")
+    }
+
+    # --- RUN 2: GOBP ONLY (Independent FDR) ---
+    res_gobp <- run_single_sample_gsea(file_path, gobp_gs, seed = CONFIG$seed)
+    if(!is.null(res_gobp)) {
+      res_gobp <- res_gobp %>% mutate(Source = "GOBP")
+    }
+    
+    # --- COMBINE ---
+    final_res <- bind_rows(res_reactome, res_gobp)
+    
+    if (nrow(final_res) > 0) {
+      write_csv(final_res, out_file)
+      return(paste0(sample_name, ": SUCCESS"))
+    } else {
+      return(paste0(sample_name, ": WARN (No results)"))
+    }
+    
+  }, error = function(e) return(paste0(sample_name, ": ERROR (", e$message, ")")))
+}
+
+stopCluster(cl)
+log_msg("Parallel Execution Finished.")
+
+# ==============================================================================
+# PART 3: AGGREGATION & VISUALIZATION
+# ==============================================================================
+
+log_msg("Aggregating results...")
+
+res_files <- dir_ls(CONFIG$output_path, glob = "*_GSEA_Module_results.csv")
+if(length(res_files) == 0) stop("No results found to plot!")
+
+combined_res <- map_dfr(res_files, function(f) {
+  read_csv(f, show_col_types = FALSE) %>%
+    dplyr::select(pathway, NES, padj) %>%
+    mutate(
+      Sample = str_remove(basename(f), "_GSEA_Module_results.csv"),
+      NES = as.numeric(NES),
+      padj = as.numeric(padj)
+    )
+}) %>%
+  left_join(module_info, by = "pathway") %>%
+  filter(!is.na(Module_Name))
+
+# --- Plotting Helpers ---
+
+# Helper: Filter to Top 50 by minimum Adjusted P-value
+filter_top_50 <- function(data) {
+  top_paths <- data %>%
+    group_by(pathway) %>%
+    summarize(min_padj = min(padj, na.rm = TRUE), .groups = "drop") %>%
+    arrange(min_padj) %>%
+    slice_head(n = 50) %>%
+    pull(pathway)
+  
+  data %>% filter(pathway %in% top_paths)
+}
+
+# Helper: Plot Heatmap (Fixed Aspect)
+plot_heatmap_fixed <- function(data, mod_name, cohort_name, annotation_map, mask_sig = FALSE) {
+  
+  # 1. Pivot Data (Always full data first to determine clustering)
+  nes_mat_full <- data %>% 
+    dplyr::select(pathway, Sample, NES) %>% 
+    tidyr::pivot_wider(names_from = Sample, values_from = NES, values_fill = 0) %>% 
+    tibble::column_to_rownames("pathway") %>% 
+    as.matrix()
+  
+  padj_mat_full <- data %>% 
+    dplyr::select(pathway, Sample, padj) %>% 
+    tidyr::pivot_wider(names_from = Sample, values_from = padj, values_fill = 1) %>% 
+    tibble::column_to_rownames("pathway") %>% 
+    as.matrix()
+  
+  # 2. Align Data
+  common_rows <- intersect(rownames(nes_mat_full), rownames(padj_mat_full))
+  common_cols <- intersect(colnames(nes_mat_full), colnames(padj_mat_full))
+  if(length(common_rows) < 1 || length(common_cols) < 1) return(NULL)
+  
+  nes_mat_full <- nes_mat_full[common_rows, common_cols, drop=FALSE]
+  padj_mat_full <- padj_mat_full[common_rows, common_cols, drop=FALSE]
+  
+  # Pre-compute clustering on Full data so both plots (Full & Masked) look identical
+  row_clust <- if(nrow(nes_mat_full) > 1) hclust(dist(nes_mat_full)) else FALSE
+  col_clust <- if(ncol(nes_mat_full) > 1) hclust(dist(t(nes_mat_full))) else FALSE
+  
+  # 3. MASKING LOGIC
+  suffix <- "Full"
+  nes_to_plot <- nes_mat_full
+  
+  if(mask_sig) {
+    suffix <- "SigMasked"
+    # Safety check: if nothing is significant, log and skip
+    if(sum(padj_mat_full <= 0.05, na.rm = TRUE) == 0) {
+      log_msg(paste("[SKIP] No significant entries for", mod_name, cohort_name))
+      return(NULL)
+    }
+    # Grey out insignificant cells
+    nes_to_plot[padj_mat_full > 0.05] <- NA
+  }
+  
+  # 4. PREPARE ANNOTATIONS
+  anno_col <- data.frame(row.names = colnames(nes_to_plot))
+  anno_col$Tissue <- annotation_map$Tissue[match(rownames(anno_col), annotation_map$Key)]
+  
+  # 5. DYNAMIC DIMENSIONS
+  cell_w <- 12; cell_h <- 12; font_size <- 8
+  row_text_space <- max(nchar(rownames(nes_to_plot)), 0) * 8 
+  col_text_space <- max(nchar(colnames(nes_to_plot)), 0) * 8
+  
+  calc_w <- max(((ncol(nes_to_plot) * cell_w) + row_text_space + 600) / 72, 10)
+  calc_h <- max(((nrow(nes_to_plot) * cell_h) + col_text_space + 400) / 72, 8)
+  
+  colors <- colorRampPalette(c("navy", "white", "firebrick"))(100)
+  limit <- max(abs(nes_mat_full), na.rm = TRUE)
+  if(!is.finite(limit) || limit == 0) limit <- 1
+  breaks <- seq(-limit, limit, length.out = 101)
+  
+  clean_mod_name <- gsub("[^A-Za-z0-9]", "_", mod_name)
+  fname <- path(CONFIG$output_path, sprintf("Heatmap_%s_%s_%s_Top50.png", clean_mod_name, cohort_name, suffix))
+  
+  tryCatch({
+    pheatmap(nes_to_plot, 
+             color = colors, breaks = breaks, na_col = "grey90",
+             annotation_col = anno_col, 
+             cellwidth = cell_w, cellheight = cell_h,
+             fontsize = font_size, 
+             cluster_rows = row_clust, # Use pre-computed clustering
+             cluster_cols = col_clust, # Use pre-computed clustering
+             main = sprintf("%s: %s (%s) - Top 50", mod_name, cohort_name, suffix),
+             filename = fname,
+             width = calc_w, height = calc_h)
+    log_msg(paste("Saved:", fname))
+  }, error = function(e) log_msg(paste("ERROR plotting:", e$message), "ERROR"))
+}
+
+# --- Execution Loop ---
+log_msg("Generating Plots (Top 50 per Cohort)...")
+unique_mods <- unique(module_info$Module_Name)
+
+for (mod in unique_mods) {
+  mod_df <- combined_res %>% filter(Module_Name == mod)
+  
+  for (coh_name in names(cohorts)) {
+    coh_samples <- cohorts[[coh_name]]
+    plot_df <- mod_df %>% filter(Sample %in% coh_samples)
+    
+    if (nrow(plot_df) == 0) next
+    
+    # 1. Filter Top 50 FIRST (ensures both plots show the same subsets)
+    top50_df <- filter_top_50(plot_df)
+    if (nrow(top50_df) == 0) next
+    
+    # 2. Plot Full
+    plot_heatmap_fixed(top50_df, mod, coh_name, tissue_map, mask_sig = FALSE)
+    
+    # 3. Plot Masked
+    plot_heatmap_fixed(top50_df, mod, coh_name, tissue_map, mask_sig = TRUE)
+  }
+}
+
+log_msg("--- Pipeline Complete ---")
+
+
+
