@@ -1,3 +1,14 @@
+#First, set your project root, and download the most recent version of ARCHS4's mouse_gene_v2.latest.h5 file. You can, alternatively, download just the GSE series specified in the metadata file (Supplementary table 2) but this code assumes you just have the entire mouse counts dataset from archs4.
+
+PROJECT_ROOT <- ""
+
+#For counts files not in ARCHS4, supplementary table 2: 'S2_Sample_Metadata' has critical columns 'Sample_ID_backup' and 'path' which will direct the script to these counts files. This particular script does depend on the metadata file to generate its DEseq signatures.
+
+#For this project, rat count files were translated into mice (via biomart) to be inserted into the pipeline here. It was confirmed this standardization step did not affect reversal results, by doing DEseq on the rat counts files, translating directly to human, and running reversal. Therefore, non-mouse counts files may also be inserted into the pipeline in the next script, which functions as a further standardization step that transforms signatures into the format expected for all downstream steps.
+
+
+PROJECT_ROOT <- "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab/semaglutide_project/Full_Survey_Semaglutide"
+
 suppressPackageStartupMessages({
   library(readr); library(dplyr); library(stringr); library(tibble); library(tidyr)
   library(DESeq2); library(rhdf5); library(purrr); library(readxl)
@@ -6,12 +17,15 @@ suppressPackageStartupMessages({
 # ==============================================================================
 # SECTION 0: CONFIGURATION (User-Editable)
 # ==============================================================================
-# TODO: Update these paths for your specific environment or move to a config file
+
+ARCHS4_H5 <- "~/data/mouse_gene_v2.2.h5" #Whereever you have downloaded the archs4 file.
+
 CONFIG <- list(
-  meta_file = "C:/Documents/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Mouse_Signature_Metadata_Formatted.xlsx",
-  archs4_h5 = "C:/Documents/science/ChenLab/mouse_gene_v2.latest.h5",
-  out_dir   = "C:/Documents/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/All_DE_Signatures"
+  meta_file = file.path(PROJECT_ROOT, "Mouse_Signature_Metadata_Formatted.xlsx"),
+  archs4_h5 = ARCHS4_H5,
+  out_dir   = file.path(PROJECT_ROOT, "all_de_signatures")
 )
+
 
 # ==============================================================================
 # SECTION 1: USER-PROVIDED HELPER FUNCTIONS
@@ -93,16 +107,6 @@ apply_rigorous_qc <- function(counts) {
     message("   -> [VERBOSE] No samples failed Zero-Count QC.")
   }
   
-  # 2. Gene QC: Exclude lowly expressed genes (CPM < 1 in < 2 samples)
-  #    Calculated manually to avoid edgeR dependency
-  #    Formula: (count / total_counts_in_sample) * 1,000,000
- # cpm <- t(t(counts) / colSums(counts, na.rm=TRUE)) * 1e6
-  
-  # Keep genes where at least 2 samples have CPM >= 1
-  #keep_genes <- rowSums(cpm >= 1, na.rm = TRUE) >= 2
-  
- # message(sprintf("   -> [QC] Filtering low expression genes: Keeping %d / %d genes.", sum(keep_genes), nrow(counts)))
-  #counts <- counts[keep_genes, , drop = FALSE]
   
   message(sprintf("   -> [VERBOSE] Final QC Matrix: %d genes x %d samples", nrow(counts), ncol(counts)))
   
@@ -376,98 +380,3 @@ if(length(results_summary) > 0) {
   
   print(final_summary)
 }
-
-
-
-# --- Gene ID Standardization Script (Case-Insensitive Fix) ---
-
-# 1. LOAD REQUIRED LIBRARIES
-suppressPackageStartupMessages(library(tidyverse))
-
-# 2. DEFINE FILE PATHS
-input_dir    <- "C:\\Documents\\science\\ChenLab\\semaglutide_project\\Full_Survey_Semaglutide\\All_DE_Signatures"
-output_dir   <- "C:\\Documents\\science\\ChenLab\\semaglutide_project\\Full_Survey_Semaglutide\\DE_signatures_Standardized"
-mapping_file <- "C:\\Documents\\science\\ChenLab\\mouse_human_gene_mapping.csv"
-
-# 3. CREATE OUTPUT DIRECTORY
-if (!dir.exists(output_dir)) dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
-
-# 4. LOAD GENE MAPPING FILE
-cat("Loading gene mapping file...\n")
-gene_map <- read_csv(mapping_file, show_col_types = FALSE) %>%
-  dplyr::rename(
-    Mouse_Ensembl = ensembl_gene_id,
-    Mouse_Symbol = external_gene_name,
-    Human_Ensembl = hsapiens_homolog_ensembl_gene,
-    Human_Symbol = hsapiens_homolog_associated_gene_name
-  ) %>%
-  dplyr::select(Mouse_Symbol, Mouse_Ensembl, Human_Symbol, Human_Ensembl) %>%
-  distinct() %>%
-  # *** FIX 1: Create a normalized Uppercase column for matching ***
-  mutate(Mouse_Symbol_Upper = toupper(Mouse_Symbol))
-
-# 5. LIST INPUT FILES
-files_to_process <- list.files(
-  path = input_dir,
-  pattern = "_DESeq2_results.csv$",
-  full.names = TRUE,
-  recursive = TRUE
-)
-
-cat(paste("Found", length(files_to_process), "files to process.\n"))
-
-# 6. PROCESS EACH FILE
-for (file_path in files_to_process) {
-  
-  file_name <- basename(file_path)
-  cat(paste("Processing:", file_name, "...\n"))
-  
-  # Read results
-  deseq_results <- read_csv(file_path, show_col_types = FALSE)
-  
-  # Save original column names (excluding gene_id)
-  original_cols <- names(deseq_results)[names(deseq_results) != "gene_id"]
-  
-  # --- Gene ID Detection and Mapping ---
-  
-  # 6a. Process rows where gene_id is a Mouse Symbol (Case-Insensitive)
-  symbol_rows <- deseq_results %>%
-    dplyr::filter(!grepl("^ENSMUSG", gene_id)) %>%
-    # *** FIX 2: Normalize input ID to uppercase for matching ***
-    dplyr::mutate(Mouse_Symbol_Upper = toupper(gene_id)) %>%
-    # Join using the UPPERCASE columns
-    dplyr::left_join(gene_map, by = "Mouse_Symbol_Upper") %>%
-    # If the map provided a "proper" Mouse Symbol (Title Case), use it.
-    # Otherwise, fallback to the original gene_id.
-    dplyr::mutate(Mouse_Symbol = coalesce(Mouse_Symbol, gene_id))
-    
-  # 6b. Process rows where gene_id is a Mouse Ensembl ID
-  ensembl_rows <- deseq_results %>%
-    dplyr::filter(grepl("^ENSMUSG", gene_id)) %>%
-    dplyr::mutate(Mouse_Ensembl = gene_id) %>%
-    # Join by Ensembl ID (standard join)
-    dplyr::left_join(gene_map, by = "Mouse_Ensembl") %>%
-    # Remove the extra uppercase column coming from gene_map (we don't need it here)
-    dplyr::select(-any_of("Mouse_Symbol_Upper"))
-    
-  # 6c. Recombine
-  final_results <- dplyr::bind_rows(symbol_rows, ensembl_rows)
-  
-  # 6d. Reorder columns and drop the temporary helper column
-  final_results <- final_results %>%
-    dplyr::select(
-      gene_id, 
-      Mouse_Symbol,
-      Mouse_Ensembl,
-      Human_Symbol,
-      Human_Ensembl,
-      all_of(original_cols)
-    )
-    
-  # 7. WRITE
-  output_file_path <- file.path(output_dir, file_name)
-  write_csv(final_results, output_file_path)
-}
-
-cat("\n--- All files processed and standardized successfully. ---\n")
-
