@@ -1,0 +1,97 @@
+
+#this script standardizes the signatures into the format expected in all downstream steps. Joining non-mouse signatures may be performed here so long as they are tables with columns of the same names in the same output directory. 
+
+#This script also depends on a biomart mapping file. That file can be found on the github for download.
+
+
+# --- Gene ID Standardization Script (Case-Insensitive Fix) ---
+
+# 1. LOAD REQUIRED LIBRARIES
+suppressPackageStartupMessages(library(tidyverse))
+
+# 2. DEFINE FILE PATHS
+input_dir    <- file.path(PROJECT_ROOT, "all_de_signatures")
+output_dir   <- file.path(PROJECT_ROOT, "de_signatures_standardized")
+mapping_file <- file.path(PROJECT_ROOT, "mouse_human_gene_mapping.csv")
+
+# 3. CREATE OUTPUT DIRECTORY
+if (!dir.exists(output_dir)) dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 4. LOAD GENE MAPPING FILE
+cat("Loading gene mapping file...\n")
+gene_map <- read_csv(mapping_file, show_col_types = FALSE) %>%
+  dplyr::rename(
+    Mouse_Ensembl = ensembl_gene_id,
+    Mouse_Symbol = external_gene_name,
+    Human_Ensembl = hsapiens_homolog_ensembl_gene,
+    Human_Symbol = hsapiens_homolog_associated_gene_name
+  ) %>%
+  dplyr::select(Mouse_Symbol, Mouse_Ensembl, Human_Symbol, Human_Ensembl) %>%
+  distinct() %>%
+  # *** FIX 1: Create a normalized Uppercase column for matching ***
+  mutate(Mouse_Symbol_Upper = toupper(Mouse_Symbol))
+
+# 5. LIST INPUT FILES
+files_to_process <- list.files(
+  path = input_dir,
+  pattern = "_DESeq2_results.csv$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+cat(paste("Found", length(files_to_process), "files to process.\n"))
+
+# 6. PROCESS EACH FILE
+for (file_path in files_to_process) {
+  
+  file_name <- basename(file_path)
+  cat(paste("Processing:", file_name, "...\n"))
+  
+  # Read results
+  deseq_results <- read_csv(file_path, show_col_types = FALSE)
+  
+  # Save original column names (excluding gene_id)
+  original_cols <- names(deseq_results)[names(deseq_results) != "gene_id"]
+  
+  # --- Gene ID Detection and Mapping ---
+  
+  # 6a. Process rows where gene_id is a Mouse Symbol (Case-Insensitive)
+  symbol_rows <- deseq_results %>%
+    dplyr::filter(!grepl("^ENSMUSG", gene_id)) %>%
+    # *** FIX 2: Normalize input ID to uppercase for matching ***
+    dplyr::mutate(Mouse_Symbol_Upper = toupper(gene_id)) %>%
+    # Join using the UPPERCASE columns
+    dplyr::left_join(gene_map, by = "Mouse_Symbol_Upper") %>%
+    # If the map provided a "proper" Mouse Symbol (Title Case), use it.
+    # Otherwise, fallback to the original gene_id.
+    dplyr::mutate(Mouse_Symbol = coalesce(Mouse_Symbol, gene_id))
+    
+  # 6b. Process rows where gene_id is a Mouse Ensembl ID
+  ensembl_rows <- deseq_results %>%
+    dplyr::filter(grepl("^ENSMUSG", gene_id)) %>%
+    dplyr::mutate(Mouse_Ensembl = gene_id) %>%
+    # Join by Ensembl ID (standard join)
+    dplyr::left_join(gene_map, by = "Mouse_Ensembl") %>%
+    # Remove the extra uppercase column coming from gene_map (we don't need it here)
+    dplyr::select(-any_of("Mouse_Symbol_Upper"))
+    
+  # 6c. Recombine
+  final_results <- dplyr::bind_rows(symbol_rows, ensembl_rows)
+  
+  # 6d. Reorder columns and drop the temporary helper column
+  final_results <- final_results %>%
+    dplyr::select(
+      gene_id, 
+      Mouse_Symbol,
+      Mouse_Ensembl,
+      Human_Symbol,
+      Human_Ensembl,
+      all_of(original_cols)
+    )
+    
+  # 7. WRITE
+  output_file_path <- file.path(output_dir, file_name)
+  write_csv(final_results, output_file_path)
+}
+
+cat("\n--- All files processed and standardized successfully. ---\n")
