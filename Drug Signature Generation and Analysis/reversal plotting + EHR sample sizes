@@ -1,0 +1,348 @@
+
+#ADJUSTED Stouffers.
+
+# --- Forest Plot: Stouffer's Method (Dual Output) ---
+#
+# Logic:
+# 1. Test: Stouffer's Z-Score Method with Multiple Testing Correction (FDR).
+# 2. Outputs:
+#    - Graph A: Sorted by Mean Effect Size (Visualizes "How strong is the effect?").
+#    - Graph B: Sorted by Stouffer Z (Visualizes "How strong is the evidence?").
+# 3. Min Signatures: 1
+# 4. Zoom: Dynamic (Calculated per graph type to fit all data).
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(gridExtra)
+  library(cowplot) 
+})
+
+# 1. CONFIGURATION
+# ----------------
+results_csv_path <- "E:/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Reversal2.4.2026Signatures/Semaglutide_Reversal_Scores_2026.csv"
+meta_path        <- "E:/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Mouse_Signature_Metadata_Formatted.xlsx"
+output_plot_dir  <- "E:/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Reversal2.4.2026Signatures/Plots/Forest_Plots"
+
+# *** VISUAL SETTINGS ***
+# Note: Zoom limits are now calculated dynamically inside generate_forest_plot
+# to accommodate large Stouffer scores.
+
+# UPDATED: Set to 1 as requested.
+min_signatures <- 1 
+
+if (!dir.exists(output_plot_dir)) dir.create(output_plot_dir, recursive = TRUE)
+
+# 2. LOAD & CLEAN
+# ---------------
+cat("Loading data...\n")
+all_results <- read_csv(results_csv_path, show_col_types = FALSE)
+meta <- read_excel(meta_path)
+
+merged_results <- all_results %>%
+  mutate(Key = str_remove(Drug_Signature, "_DESeq2_results.csv")) %>%
+  left_join(meta, by = "Key") %>%
+  distinct(Key, Disease_Signature, .keep_all = TRUE)
+
+# *** FILTERING STEP ***
+cat("Filtering for Semaglutide (Excluding EBI)...\n")
+plot_data_raw <- merged_results %>%
+  filter(
+    str_detect(Key, "_S_") | str_detect(Key, "_s_") | 
+    (if("perturbation" %in% names(.)) str_detect(perturbation, regex("Semaglutide", ignore_case = TRUE)) else FALSE)
+  ) %>%
+  filter(!str_detect(Key, "EBI"))
+
+cat(paste("Remaining Signatures:", nrow(plot_data_raw), "\n"))
+
+# 3. CALCULATE STATS
+# ------------------
+cat("Calculating Stouffer statistics and adjusting P-values...\n")
+
+get_stouffer_stats <- function(x) {
+  x <- x[!is.na(x)]
+  n <- length(x)
+  
+  # 1. Median Effect Size
+  median_z <- median(x)
+  
+  # 2. Stouffer's Z (Evidence Strength)
+  stouffer_z_score <- sum(x) / sqrt(n)
+  
+  # 3. Raw P-Value
+  p_val_raw <- 2 * pnorm(-abs(stouffer_z_score))
+  
+  c(median = median_z, n = n, stouffer_z = stouffer_z_score, p_val_raw = p_val_raw)
+}
+
+stats_df <- plot_data_raw %>%
+  group_by(Disease_Name) %>%
+  summarize(stats = list(get_stouffer_stats(Z_Score_Median))) %>%
+  unnest_wider(stats) %>%
+  ungroup() %>%
+  # Filter first so we don't penalize the P-value adjustment for dropped diseases
+  filter(n >= min_signatures) %>%
+  # Apply Benjamini-Hochberg FDR correction across all remaining diseases
+  mutate(
+    p_val_adj = p.adjust(p_val_raw, method = "BH"),
+    sig = case_when(
+      p_val_adj < 0.05 & median > 0 ~ 1,
+      p_val_adj < 0.05 & median < 0 ~ -1,
+      TRUE ~ 0
+    ),
+    bar_color = case_when(
+      sig == 1 ~ "#C0392B",  
+      sig == -1 ~ "#2E86C1", 
+      TRUE ~ "grey70"       
+    )
+  )
+
+cat(paste("Total diseases to plot:", nrow(stats_df), "\n"))
+
+# 4. GENERALIZED PLOTTING FUNCTION
+# --------------------------------
+# Logic: Generates a 2-column panel plot based on a specific sorting/plotting variable
+generate_forest_plot <- function(stats_data, raw_data, sort_var, plot_var, x_label, filename) {
+  
+  cat(paste0("Generating plot: ", filename, " (Sorted by ", sort_var, ")\n"))
+  
+  # --- DYNAMIC ZOOM CALCULATION ---
+  # We need limits that fit BOTH the main dots (plot_var) and the raw jitter (Z_Score_Median)
+  # across the ENTIRE dataset (so Left and Right panels share the same scale).
+  
+  min_dot <- min(stats_data[[plot_var]], na.rm = TRUE)
+  max_dot <- max(stats_data[[plot_var]], na.rm = TRUE)
+  
+  min_raw <- min(raw_data$Z_Score_Median, na.rm = TRUE)
+  max_raw <- max(raw_data$Z_Score_Median, na.rm = TRUE)
+  
+  # Global min/max for this graph type
+  global_min <- min(min_dot, min_raw)
+  global_max <- max(max_dot, max_raw)
+  
+  # Ensure 0 is included (standard for forest plots)
+  if (global_min > 0) global_min <- -1
+  if (global_max < 0) global_max <- 1
+  
+  # Add 10% padding
+  span <- global_max - global_min
+  if (span == 0) span <- 2
+  pad <- span * 0.1
+  
+  dynamic_xlim <- c(global_min - pad, global_max + pad)
+  
+  cat(paste("  Dynamic X-Limits:", round(dynamic_xlim[1], 2), "to", round(dynamic_xlim[2], 2), "\n"))
+  
+  # A. Sort Data
+  # We sort the stats dataframe by the requested variable (e.g., mean or stouffer_z)
+  sorted_stats <- stats_data %>% arrange(!!sym(sort_var))
+  
+  # B. Split Data (Left/Right)
+  total_rows <- nrow(sorted_stats)
+  halfway <- ceiling(total_rows / 2)
+  
+  # We arrange desc() here to order them correctly on the Y-axis (Top to Bottom visual flow)
+  left_data <- sorted_stats[1:halfway, ] %>% arrange(desc(!!sym(sort_var)))
+  left_data$Disease_Name <- factor(left_data$Disease_Name, levels = left_data$Disease_Name)
+  
+  right_data <- sorted_stats[(halfway + 1):total_rows, ] %>% arrange(desc(!!sym(sort_var)))
+  right_data$Disease_Name <- factor(right_data$Disease_Name, levels = right_data$Disease_Name)
+  
+  # C. Panel Helper Function
+  create_panel <- function(data_subset) {
+    # Filter raw points to match the diseases in this subset
+    subset_raw <- raw_data %>% filter(Disease_Name %in% data_subset$Disease_Name)
+    subset_raw$Disease_Name <- factor(subset_raw$Disease_Name, levels = levels(data_subset$Disease_Name))
+    
+    ggplot(data_subset, aes(x = .data[[plot_var]], y = Disease_Name)) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+      
+      # Jitter (Always Raw Z-Scores)
+      geom_jitter(
+        data = subset_raw, 
+        aes(x = Z_Score_Median, y = Disease_Name),
+        height = 0.2, width = 0,
+        alpha = 0.3, color = "grey60", size = 1.0
+      ) +
+      
+      # Main Dot (Dynamic: Either Mean or Stouffer Z, colored by adjusted significance)
+      geom_point(aes(color = bar_color), size = 3) +
+      
+      coord_cartesian(xlim = dynamic_xlim) + 
+      scale_color_identity() +
+      labs(title = NULL, x = x_label, y = NULL) +
+      theme_bw() +
+      theme(
+        panel.grid.major.y = element_line(color = "grey95"),
+        panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 7),
+        plot.title = element_text(face = "bold", size = 10)
+      )
+  }
+  
+  # D. Stitch and Save
+  p_left <- create_panel(left_data)
+  p_right <- create_panel(right_data)
+  
+  col_height <- 1.5 + (0.16 * halfway) 
+  final_plot <- plot_grid(p_left, p_right, ncol = 2, align = "h")
+  
+  ggsave(file.path(output_plot_dir, filename), final_plot, width = 14, height = col_height, limitsize = FALSE)
+  cat(paste("Saved:", filename, "\n"))
+}
+
+# 5. EXECUTE GENERATION
+# ---------------------
+
+# Single Graph: Sorted and plotted by Median, Significance from Stouffer
+generate_forest_plot(
+  stats_df, 
+  plot_data_raw, 
+  sort_var = "median", 
+  plot_var = "median", 
+  x_label = "Median Z-Score", 
+  filename = "AAForest_Plot_ADJUSTEDPVALUES.png"
+)
+
+cat("\nPlot generated successfully.\n")
+
+# --- ADD-ON: Sample Size Bar Charts alongside Forest Plot ---
+#
+# Prerequisites: Run the main Stouffer script first.
+# Assumes the following objects are already in the environment:
+#   - stats_df        (from Step 3 of main script)
+#   - plot_data_raw   (from Step 2 of main script)
+#   - output_plot_dir (from Step 1 of main script)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(cowplot)
+})
+
+# ── PATH ───────────────────────────────────────────────────────────────────────
+sample_size_path <- "E:/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Reversal2.4.2026Signatures/EHRstuff/Sample_Size/Sample_Size_Individual_Disease_Whole_MSDWlatest.csv"
+
+# ── 1. LOAD SAMPLE SIZES ───────────────────────────────────────────────────────
+ss_raw <- read_csv(sample_size_path, show_col_types = FALSE)
+
+stats_df_with_ss <- stats_df %>%
+  left_join(
+    ss_raw %>% select(Disease_Name = Original_Disease_Name, sample_size = SAMPLE_SIZE),
+    by = "Disease_Name"
+  )
+
+unmatched <- stats_df_with_ss %>% filter(is.na(sample_size)) %>% pull(Disease_Name)
+if (length(unmatched) > 0) {
+  cat("⚠ Warning — diseases with no sample size match:\n")
+  cat(paste(" •", unmatched, collapse = "\n"), "\n")
+}
+
+max_sample_size <- max(stats_df_with_ss$sample_size, na.rm = TRUE)
+
+# ── 2. PANEL BUILDER FUNCTIONS ─────────────────────────────────────────────────
+create_forest_panel <- function(data_subset) {
+  raw_sub <- plot_data_raw %>%
+    filter(Disease_Name %in% data_subset$Disease_Name) %>%
+    mutate(Disease_Name = factor(Disease_Name, levels = levels(data_subset$Disease_Name)))
+
+  ggplot(data_subset, aes(x = median, y = Disease_Name)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.4) +
+    geom_jitter(
+      data   = raw_sub,
+      aes(x = Z_Score_Median, y = Disease_Name),
+      height = 0.18, width = 0,
+      alpha  = 0.25, color = "grey55", size = 0.7, shape = 16
+    ) +
+    geom_point(aes(color = bar_color), size = 2.8, shape = 16) +
+    scale_color_identity() +
+    scale_x_continuous(limits = c(-5, 5), breaks = seq(-4, 4, by = 2)) +
+    labs(x = "Median Z-Score", y = NULL) +
+    theme_bw(base_size = 9) +
+    theme(
+      panel.grid.major.y = element_line(color = "grey93"),
+      panel.grid.minor   = element_blank(),
+      axis.text.y        = element_text(size = 7),
+      axis.text.x        = element_text(size = 7)
+    )
+}
+
+create_bar_panel <- function(data_ss) {
+  plot_df <- data_ss %>%
+    mutate(
+      sample_size_plot = ifelse(is.na(sample_size) | sample_size == 0, NA, sample_size),
+      bar_alpha        = ifelse(is.na(sample_size), 0, 1)
+    )
+
+  ggplot(plot_df, aes(x = sample_size_plot, y = Disease_Name)) +
+    geom_col(
+      aes(alpha = bar_alpha),
+      fill  = "#5D6D7E",
+      width = 0.6
+    ) +
+    scale_alpha_identity() +
+    scale_x_sqrt(
+      limits = c(0, max_sample_size * 1.1),
+      labels = scales::comma,
+      expand = c(0, 0)
+    ) +
+    labs(x = "Sample Size (N, sqrt scale)", y = NULL) +
+    theme_bw() +
+    theme(
+      panel.grid.major.y = element_line(color = "grey95"),
+      panel.grid.minor   = element_blank(),
+      axis.text.y        = element_blank(),
+      axis.ticks.y       = element_blank(),
+      axis.text.x        = element_text(size = 7)
+    )
+}
+
+# ── 3. MAIN GENERATOR FUNCTION ─────────────────────────────────────────────────
+generate_forest_with_samplesize <- function(stats_data, stats_data_ss, raw_data,
+                                            sort_var, plot_var, x_label, filename) {
+  sorted <- stats_data %>%
+    arrange(.data[[sort_var]]) %>%
+    mutate(Disease_Name = factor(Disease_Name, levels = Disease_Name))
+
+  halfway    <- ceiling(nrow(sorted) / 2)
+  left_names  <- levels(sorted$Disease_Name)[1:halfway]
+  right_names <- levels(sorted$Disease_Name)[(halfway + 1):nrow(sorted)]
+
+  left_data  <- sorted %>% filter(Disease_Name %in% left_names)  %>% mutate(Disease_Name = factor(Disease_Name, levels = left_names))
+  right_data <- sorted %>% filter(Disease_Name %in% right_names) %>% mutate(Disease_Name = factor(Disease_Name, levels = right_names))
+  left_ss    <- stats_data_ss %>% filter(Disease_Name %in% left_names)  %>% mutate(Disease_Name = factor(Disease_Name, levels = left_names))
+  right_ss   <- stats_data_ss %>% filter(Disease_Name %in% right_names) %>% mutate(Disease_Name = factor(Disease_Name, levels = right_names))
+
+  p_forest_left  <- create_forest_panel(left_data)
+  p_bar_left     <- create_bar_panel(left_ss)
+  p_forest_right <- create_forest_panel(right_data)
+  p_bar_right    <- create_bar_panel(right_ss)
+
+  col_height <- 1.5 + (0.16 * halfway)
+
+  final_plot <- plot_grid(
+    p_forest_left, p_bar_left, p_forest_right, p_bar_right,
+    ncol       = 4,
+    align      = "h",
+    axis       = "tb",
+    rel_widths = c(2, 1, 2, 1)
+  )
+
+  ggsave(file.path(output_plot_dir, filename), final_plot, width = 20, height = col_height, limitsize = FALSE)
+  cat(paste("Saved:", filename, "\n"))
+}
+
+# ── 4. EXECUTE ─────────────────────────────────────────────────────────────────
+generate_forest_with_samplesize(
+  stats_data    = stats_df,
+  stats_data_ss = stats_df_with_ss,
+  raw_data      = plot_data_raw,
+  sort_var      = "median",
+  plot_var      = "median",
+  x_label       = "Median Z-Score",
+  filename      = "AForest_Plot_WithSampleSize.png"
+)
+
+cat("\nAdd-on plot generated successfully.\n")
+
+
+
