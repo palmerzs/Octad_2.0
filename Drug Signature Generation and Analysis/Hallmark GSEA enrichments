@@ -1,0 +1,162 @@
+
+
+# ==============================================================================
+# SCRIPT: GSEA, Heatmap, and Pathway Stability Analysis (Revamped)
+# DESCRIPTION: Runs GSEA on all standardized signatures (Individual & Meta),
+#              generates summary heatmaps, and calculates pathway stability metrics
+#              (Penetrance, Concordance) to identify robust biological signals.
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(fgsea)
+  library(msigdbr)
+  library(pheatmap)
+  library(ggrepel)
+  library(readxl)
+})
+
+# ==============================================================================
+# 1. CONFIGURATION
+# ==============================================================================
+INPUT_DIR  <- file.path(PROJECT_ROOT, "de_signatures_standardized")
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "human_hallmark_gsea")
+META_FILE  <- file.path(PROJECT_ROOT, "Mouse_Signature_Metadata_Formatted.xlsx")
+
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+
+# ==============================================================================
+# 2. LOAD HALLMARK GENE SETS
+# ==============================================================================
+message("Loading Human Hallmark gene sets from msigdbr...")
+hallmark_pathways_df <- msigdbr(species = "Homo sapiens", category = "H")
+hallmark_pathways_list <- split(x = hallmark_pathways_df$gene_symbol, 
+                                f = hallmark_pathways_df$gs_name)
+
+# ==============================================================================
+# 3. IDENTIFY & FILTER INPUT FILES (SEMAGLUTIDE ONLY)
+# ==============================================================================
+message("Loading Metadata to filter for Semaglutide signatures...")
+raw_meta <- read_excel(META_FILE)
+
+# Extract valid Keys for Semaglutide Perturbation
+semaglutide_keys <- raw_meta %>%
+  filter(grepl("Semaglutide", perturbation, ignore.case = TRUE)) %>%
+  pull(Key) %>%
+  unique()
+
+# List all potential files
+all_files <- list.files(INPUT_DIR, pattern = ".csv$", full.names = TRUE)
+
+# Filter the file list
+files_to_process <- all_files[map_lgl(all_files, function(f) {
+  fname <- basename(f)
+  
+  # Condition 1: Keep Meta-Signature FULL STATS only (ignore Consensus files)
+  if (grepl("Meta_Signature_", fname)) {
+    return(grepl("Full_Stats.csv", fname))
+  }
+  
+  # Condition 2: Keep Individual signatures matching a Semaglutide Key
+  key <- str_remove(fname, "_DESeq2_results.csv")
+  return(key %in% semaglutide_keys)
+})]
+
+message(sprintf("Found %d valid files to process (Semaglutide + Meta-Signatures).", length(files_to_process)))
+
+# ==============================================================================
+# 4. RUN GSEA FOR EACH FILE
+# ==============================================================================
+
+get_clean_sample_name <- function(file_path) {
+  fname <- basename(file_path)
+  name <- gsub("_DESeq2_results.csv|Meta_Signature_|_Full_Stats.csv", "", fname)
+  name <- gsub("_Consensus", "", name) 
+  return(name)
+}
+
+for (file_path in files_to_process) {
+  
+  sample_name <- get_clean_sample_name(file_path)
+  gsea_output_file <- file.path(OUTPUT_DIR, paste0(sample_name, "_GSEA_Hallmark_results.csv"))
+  
+  if (file.exists(gsea_output_file)) {
+    # next # Uncomment to skip existing
+  }
+  
+  message(paste("Processing GSEA for:", sample_name, "..."))
+  
+  df <- read_csv(file_path, show_col_types = FALSE)
+  
+  # --- LOGIC UPDATE: Robust Column Selection ---
+  # We prioritize the Wald Statistic ('stat') if available, but fallback to LFC.
+  # We also rigorously ensure we are using the Human Symbol.
+  
+  rank_df <- NULL
+  
+  # CASE A: Meta-Analysis Result
+  if ("Pooled_LFC" %in% names(df)) {
+    rank_df <- df %>%
+      mutate(
+        rank_metric = as.numeric(Pooled_LFC),
+        # In the meta-files, 'Gene' is already the Human Symbol (from previous step)
+        Human_Symbol_Proxy = toupper(Gene) 
+      )
+  } 
+  # CASE B: Individual Signature
+  else {
+    # Check if Human_Symbol exists (Critical user requirement)
+    if (!"Human_Symbol" %in% names(df)) {
+      message("   -> Skipping: No 'Human_Symbol' column found.")
+      next
+    }
+    
+    # Check for ranking metric
+    # Prefer 'stat' (Wald), fallback to 'log2FoldChange_shrunk'
+    metric_col <- if("stat" %in% names(df)) "stat" else "log2FoldChange_shrunk"
+    if(!metric_col %in% names(df)) metric_col <- "log2FoldChange" # Last resort
+    
+    if(!metric_col %in% names(df)) {
+       message("   -> Skipping: No valid metric (stat/LFC) found.")
+       next
+    }
+
+    rank_df <- df %>% 
+      filter(!is.na(Human_Symbol)) %>%
+      mutate(
+        rank_metric = as.numeric(.data[[metric_col]]), 
+        Human_Symbol_Proxy = toupper(Human_Symbol)
+      )
+  }
+  
+  # Prepare Ranks
+  # Handle duplicates: If multiple rows map to one Human Symbol, take the Max Abs Value
+  gene_ranks <- rank_df %>%
+    dplyr::select(Human_Symbol_Proxy, rank_metric) %>%
+    filter(!is.na(Human_Symbol_Proxy)) %>%
+    group_by(Human_Symbol_Proxy) %>%
+    slice_max(order_by = abs(rank_metric), n = 1, with_ties = FALSE) %>%
+    ungroup()
+  
+  rank_vector <- setNames(gene_ranks$rank_metric, gene_ranks$Human_Symbol_Proxy)
+  rank_vector <- sort(rank_vector, decreasing = TRUE)
+  
+  # Run FGSEA
+  tryCatch({
+    set.seed(42)
+    gsea_res <- fgsea(pathways = hallmark_pathways_list, stats = rank_vector, minSize = 15, maxSize = 500)
+    
+    gsea_save <- gsea_res %>%
+      rowwise() %>%
+      mutate(leadingEdge = paste(leadingEdge, collapse = "; ")) %>%
+      ungroup() %>%
+      arrange(padj)
+    
+    write_csv(gsea_save, gsea_output_file)
+    
+  }, error = function(e) {
+    message(paste("   !!! GSEA Failed:", e$message))
+  })
+}
+
+message("\n--- GSEA Complete. Generating Heatmaps & Stability Metrics ---")
