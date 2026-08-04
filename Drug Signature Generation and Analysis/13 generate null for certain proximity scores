@@ -1,0 +1,220 @@
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEGREE-PRESERVED PERMUTATION NULL — ALL PAIRS, PER DISEASE (NO OVERRIDES)
+#
+# For each disease in `diseases_of_interest`, runs the Guney-style degree-
+# preserved permutation null (1000 draws, using compute_proximity_fast()
+# verbatim from the original pipeline) for EVERY filtered drug-disease pair.
+# Every pair is treated identically -- no manual pair selection of any kind.
+# Reports:
+#   1. A per-pair table (one row per drug-disease pair, with its own z)
+#   2. A per-disease aggregate (mean / median / min / max z across its pairs)
+#   3. A pure ranking of the best-performing pair per disease (most negative
+#      z), derived AFTER the fact from the results -- not chosen in advance.
+# ══════════════════════════════════════════════════════════════════════════════
+
+suppressPackageStartupMessages({
+  library(igraph)
+  library(dplyr)
+  library(readr)
+})
+
+prox_dir <- "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Reversal2.4.2026Signatures/Proximity"
+
+n_perm <- 1000
+set.seed(42)
+
+# ── Config: diseases to run — every pair for each, no overrides ────────────
+diseases_of_interest <- c(
+  "Arrhythmogenic-Right-Ventricular-Dysplasia",
+  "Myotonic-Dystrophy",
+  "Huntington-Disease",
+  "Glomerulonephritis-Membranous",
+  "Glomerulosclerosis-Focal-Segmental"
+)
+
+# ── Load resources ───────────────────────────────────────────────────────────
+cat("Loading resources...\n")
+string_graph          <- readRDS(file.path(prox_dir, "string_graph.rds"))
+degree_df              <- readRDS(file.path(prox_dir, "degree_df.rds"))
+drug_gene_sets_de     <- readRDS(file.path(prox_dir, "drug_gene_sets_DE.rds"))
+disease_gene_sets_de  <- readRDS(file.path(prox_dir, "disease_gene_sets_DE.rds"))
+prox_results          <- read_csv(file.path(prox_dir, "Semaglutide_Proximity_DE_Results.csv"),
+                                   show_col_types = FALSE)
+
+prox_filtered <- prox_results %>%
+  dplyr::filter(grepl("_S_", Drug_Signature)) %>%
+  dplyr::filter(!is.na(Proximity_N10))
+
+# ── Preflight: verify every disease name actually exists in the data ────────
+cat("\nPreflight check: verifying disease names against Disease_Name column...\n")
+available_diseases <- unique(prox_filtered$Disease_Name)
+missing_diseases    <- setdiff(diseases_of_interest, available_diseases)
+
+if (length(missing_diseases) > 0) {
+  cat("!! The following disease name(s) were NOT found in prox_filtered$Disease_Name:\n")
+  for (md in missing_diseases) {
+    cat(sprintf("   - '%s'\n", md))
+    words <- strsplit(md, "[-_]")[[1]]
+    close_matches <- available_diseases[sapply(available_diseases, function(a) {
+      any(sapply(words, function(w) grepl(w, a, ignore.case = TRUE)))
+    })]
+    if (length(close_matches) > 0) {
+      cat("     Possible close matches in the data:\n")
+      for (cm in head(close_matches, 5)) cat(sprintf("       -> '%s'\n", cm))
+    } else {
+      cat("     No close matches found -- this disease may not exist in disease_gene_sets_de at all.\n")
+    }
+  }
+  stop("Fix disease name(s) above (check exact spelling/casing against Disease_Name) before running the full permutation loop.")
+} else {
+  cat("  All", length(diseases_of_interest), "disease names found. Row counts:\n")
+  for (d in diseases_of_interest) {
+    cat(sprintf("    %-45s %d pairs\n", d, sum(prox_filtered$Disease_Name == d)))
+  }
+}
+
+# ── EXACT distance function from the original pipeline (verbatim) ───────────
+compute_proximity_fast <- function(graph, set_a, set_b) {
+  nodes <- igraph::V(graph)$name
+  set_a <- intersect(set_a, nodes)
+  set_b <- intersect(set_b, nodes)
+  if (length(set_a) == 0 || length(set_b) == 0) return(NA_real_)
+  dist_mat <- igraph::distances(graph, v = set_a, to = set_b)
+  d_ab <- mean(apply(dist_mat, 1, function(x) {
+    v <- x[is.finite(x)]; if (length(v) == 0) NA else min(v)
+  }), na.rm = TRUE)
+  d_ba <- mean(apply(dist_mat, 2, function(x) {
+    v <- x[is.finite(x)]; if (length(v) == 0) NA else min(v)
+  }), na.rm = TRUE)
+  (d_ab + d_ba) / 2
+}
+
+# ── Degree-bin lookup + random draw function ─────────────────────────────────
+bin_pools   <- split(degree_df$node, degree_df$bin)
+node_to_bin <- setNames(degree_df$bin, degree_df$node)
+
+draw_random_set <- function(real_set) {
+  bins_needed <- node_to_bin[real_set]
+  if (any(is.na(bins_needed))) {
+    stop("Some genes in real_set are missing from degree_df -- check ID space / staleness.")
+  }
+  drawn <- character(length(real_set))
+  used  <- character(0)
+  for (i in seq_along(real_set)) {
+    pool <- setdiff(bin_pools[[as.character(bins_needed[i])]], used)
+    if (length(pool) == 0) pool <- bin_pools[[as.character(bins_needed[i])]]  # safety fallback
+    pick <- sample(pool, 1)
+    drawn[i] <- pick
+    used <- c(used, pick)
+  }
+  drawn
+}
+
+# ── Main loop: every pair, every disease ─────────────────────────────────────
+t_start <- Sys.time()
+pair_rows_all <- list()
+n_mismatch <- 0
+
+for (disease in diseases_of_interest) {
+  disease_pairs <- prox_filtered %>% dplyr::filter(Disease_Name == disease)
+  cat(sprintf("\n=== %s: %d pairs ===\n", disease, nrow(disease_pairs)))
+
+  for (i in seq_len(nrow(disease_pairs))) {
+    row      <- disease_pairs[i, ]
+    drug_sig <- row$Drug_Signature
+    dis_sig  <- row$Disease_Signature
+    d_stored <- row$Proximity_N10
+
+    drug_set <- drug_gene_sets_de[[drug_sig]]$N10
+    dis_set  <- disease_gene_sets_de[[dis_sig]]$N10
+
+    if (is.null(drug_set) || is.null(dis_set) || length(drug_set) == 0 || length(dis_set) == 0) {
+      cat(sprintf("  [%2d/%d] SKIP (empty gene set): %s\n", i, nrow(disease_pairs), drug_sig))
+      next
+    }
+
+    d_obs <- compute_proximity_fast(string_graph, drug_set, dis_set)
+    if (is.na(d_obs)) {
+      cat(sprintf("  [%2d/%d] SKIP (NA proximity): %s\n", i, nrow(disease_pairs), drug_sig))
+      next
+    }
+    if (abs(d_obs - d_stored) > 1e-6) {
+      n_mismatch <- n_mismatch + 1
+      cat(sprintf("  [%2d/%d] !! MISMATCH vs stored CSV (recomputed=%.4f, stored=%.4f): %s\n",
+                  i, nrow(disease_pairs), d_obs, d_stored, drug_sig))
+    }
+
+    null_dist <- numeric(n_perm)
+    for (p in seq_len(n_perm)) {
+      rand_drug <- draw_random_set(drug_set)
+      rand_dis  <- draw_random_set(dis_set)
+      null_dist[p] <- compute_proximity_fast(string_graph, rand_drug, rand_dis)
+    }
+    mu_R <- mean(null_dist, na.rm = TRUE)
+    sd_R <- sd(null_dist, na.rm = TRUE)
+    z    <- (d_obs - mu_R) / sd_R
+
+    cat(sprintf("  [%2d/%d] %-55s z = %6.3f\n", i, nrow(disease_pairs), drug_sig, z))
+
+    pair_rows_all[[length(pair_rows_all) + 1]] <- data.frame(
+      Disease_Name       = disease,
+      Drug_Signature     = drug_sig,
+      Disease_Signature  = dis_sig,
+      N_Drug_Genes       = length(drug_set),
+      N_Disease_Genes    = length(dis_set),
+      Observed           = d_obs,
+      Null_Mean          = mu_R,
+      Null_SD            = sd_R,
+      Z                  = z,
+      stringsAsFactors   = FALSE
+    )
+  }
+}
+
+full_results_df <- do.call(rbind, pair_rows_all)
+rownames(full_results_df) <- NULL
+
+t_elapsed <- as.numeric(difftime(Sys.time(), t_start, units = "mins"))
+cat(sprintf("\nTotal runtime: %.1f min | Pairs computed: %d | Stored-value mismatches: %d\n",
+            t_elapsed, nrow(full_results_df), n_mismatch))
+
+# ── Per-disease aggregate (mean / median / min / max z) ─────────────────────
+agg_summary <- full_results_df %>%
+  dplyr::group_by(Disease_Name) %>%
+  dplyr::summarise(
+    n_pairs  = dplyr::n(),
+    Mean_Z   = round(mean(Z, na.rm = TRUE), 3),
+    Median_Z = round(median(Z, na.rm = TRUE), 3),
+    Min_Z    = round(min(Z, na.rm = TRUE), 3),
+    Max_Z    = round(max(Z, na.rm = TRUE), 3),
+    .groups  = "drop"
+  )
+
+cat("\n=== PER-DISEASE AGGREGATE ===\n")
+print(agg_summary)
+
+# ── Best-performing pair per disease (pure post-hoc ranking, no override) ───
+# "Best" = most negative Z, i.e. closer to the disease module than degree-
+# matched chance predicts -- not just the smallest raw distance, since raw
+# distance alone doesn't correct for degree bias. This is purely descriptive:
+# every pair above was computed identically; this just sorts the results.
+best_pair_by_z <- full_results_df %>%
+  dplyr::group_by(Disease_Name) %>%
+  dplyr::arrange(Z, .by_group = TRUE) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+
+cat("\n=== BEST-PERFORMING PAIR PER DISEASE (most negative Z) ===\n")
+print(best_pair_by_z[, c("Disease_Name", "Drug_Signature", "Observed", "Z")])
+
+# ── Save everything ───────────────────────────────────────────────────────
+write_csv(full_results_df, file.path(prox_dir, "permutation_null_all_pairs.csv"))
+write_csv(agg_summary,     file.path(prox_dir, "permutation_null_disease_aggregate.csv"))
+write_csv(best_pair_by_z,  file.path(prox_dir, "permutation_null_best_pair_by_z.csv"))
+
+cat("\nSaved:\n")
+cat("  ", file.path(prox_dir, "permutation_null_all_pairs.csv"), "\n")
+cat("  ", file.path(prox_dir, "permutation_null_disease_aggregate.csv"), "\n")
+cat("  ", file.path(prox_dir, "permutation_null_best_pair_by_z.csv"), "\n")
+
