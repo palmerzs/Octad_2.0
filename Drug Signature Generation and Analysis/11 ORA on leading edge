@@ -1,0 +1,449 @@
+
+# =============================================================================
+# Per-Row GO:BP ORA on Reversal Leading Edges -- single self-contained script
+# (parallel, restartable, progress bar) -- suitable for one R Markdown chunk.
+# -----------------------------------------------------------------------------
+# Analysis (unchanged): per row, GO:BP enrichGO(keyType="ENSEMBL"), human,
+#   p<0.05 AND q<0.05, universe = that row's drug-signature gene set.
+#
+# Behaviour:
+#   * Runs across (detectCores() - 2) workers via furrr.
+#   * Each row writes its own part files to LOCAL scratch the moment it finishes
+#     (tidy CSV + raw enrichResult rds), with the done-flag written LAST so its
+#     presence guarantees the data is on disk.
+#   * RESTARTABLE: rerun the chunk after any interruption -> rows already carrying
+#     a done-flag are skipped, and the run resumes where it stopped.
+#   * Live progress via progressr (a bar that aggregates across workers).
+#   * At the end (once all rows are done) it reassembles the parts into the three
+#     final OneDrive outputs: tidy CSV, combined rds, diagnostic log.
+#
+# Just re-run the whole chunk if it ever stops; it is safe and idempotent.
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(furrr)
+  library(future)
+  library(progressr)
+})
+
+# -----------------------------------------------------------------------------
+# 0. CONFIG
+# -----------------------------------------------------------------------------
+chenlab_root <- "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab"
+
+input_xlsx  <- "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/GLPsharedFolder/For_Sharing/Supplementary_Tables.xlsx"
+input_sheet <- "S3 Sema_Dox_Sglt2i_reversal"
+input_skip  <- 1
+
+out_dir <- file.path(chenlab_root,
+  "semaglutide_project/Full_Survey_Semaglutide/Figures/Supplement/Supplementary_Tables")
+
+# LOCAL scratch for per-row parts (NOT under OneDrive, to avoid sync thrash).
+parts_dir <- path.expand("~/ora_gobp_parts")
+
+drug_sig_dirs <- c(
+  "Semaglutide"     = file.path(chenlab_root, "semaglutide_project/Full_Survey_Semaglutide/DE_signatures_Standardized"),
+  "SGLT2_Inhibitor" = file.path(chenlab_root, "semaglutide_project/Full_Survey_Semaglutide/SGLT2is/DE_Signatures_Standardized"),
+  "Doxorubicin"     = file.path(chenlab_root, "semaglutide_project/Full_Survey_Semaglutide/Doxorubicin/DE_Signatures_Standardized")
+)
+
+P_CUTOFF <- 0.05; Q_CUTOFF <- 0.05; GO_ONT <- "BP"
+MIN_LE_GENES <- 3; LE_DELIM <- ";"
+LE_UP_COL <- "LeadingEdge_Up"; LE_DOWN_COL <- "LeadingEdge_Down"
+N_WORKERS <- max(1, parallel::detectCores() - 2)   # 12 cores -> 10
+
+out_table_path <- file.path(out_dir, "PerRow_ORA_GOBP_results.csv")
+out_rds_path   <- file.path(out_dir, "PerRow_ORA_GOBP_enrichObjects.rds")
+out_log_path   <- file.path(out_dir, "PerRow_ORA_GOBP_diagnostics.txt")
+
+# -----------------------------------------------------------------------------
+# 1. SETUP
+# -----------------------------------------------------------------------------
+if (!dir.exists(out_dir)) stop("Output directory does not exist:\n  ", out_dir)
+dir.create(parts_dir, recursive = TRUE, showWarnings = FALSE)
+
+resolve_dir <- function(path) {
+  if (dir.exists(path)) return(path)
+  parent <- dirname(path); target <- basename(path)
+  if (dir.exists(parent)) {
+    hits <- list.files(parent, full.names = TRUE)
+    m <- hits[tolower(basename(hits)) == tolower(target) & dir.exists(hits)]
+    if (length(m) == 1) return(m)
+  }
+  path
+}
+drug_sig_dirs <- vapply(drug_sig_dirs, resolve_dir, character(1))
+
+done_flag_path <- function(rid, pd = parts_dir) file.path(pd, sprintf("done_%d.flag", rid))
+
+# -----------------------------------------------------------------------------
+# 2. LOAD TABLE, STAMP row_id, DETERMINE WHAT REMAINS
+# -----------------------------------------------------------------------------
+if (!file.exists(input_xlsx)) stop("Input table not found:\n  ", input_xlsx)
+
+map_df <- read_excel(input_xlsx, sheet = input_sheet, skip = input_skip) %>%
+  mutate(row_id = row_number(), .before = 1)
+
+required_cols <- c("perturbation", "Drug_Signature", "Disease_Signature",
+                   "Disease_Name", LE_UP_COL, LE_DOWN_COL)
+missing_cols  <- setdiff(required_cols, names(map_df))
+if (length(missing_cols) > 0)
+  stop("Table is missing required columns: ", paste(missing_cols, collapse = ", "))
+
+cat(sprintf("Loaded %d rows. Workers: %d. Parts: %s\n",
+            nrow(map_df), N_WORKERS, parts_dir))
+
+already_done <- map_df$row_id[file.exists(done_flag_path(map_df$row_id))]
+if (length(already_done) > 0)
+  cat(sprintf("Restart: %d rows already complete -> skipping.\n", length(already_done)))
+todo_df <- map_df %>% filter(!(row_id %in% already_done))
+cat(sprintf("Rows remaining: %d\n", nrow(todo_df)))
+
+# -----------------------------------------------------------------------------
+# 3. ANALYSIS HELPERS (identical logic to the serial version)
+# -----------------------------------------------------------------------------
+split_le <- function(cell) {
+  if (is.na(cell) || str_trim(cell) == "") return(character(0))
+  toks <- str_trim(str_split(cell, fixed(LE_DELIM))[[1]]); toks[toks != ""]
+}
+GO_OUT_COLS <- c("ID","Description","GeneRatio","BgRatio",
+                 "pvalue","p.adjust","qvalue","geneID","Count")
+
+make_result_block <- function(meta, status, enrich_obj = NULL) {
+  if (!is.null(enrich_obj) && nrow(as.data.frame(enrich_obj)) > 0) {
+    res <- as.data.frame(enrich_obj)[, GO_OUT_COLS, drop = FALSE]
+    cbind(meta[rep(1, nrow(res)), , drop = FALSE],
+          data.frame(status = "enriched", stringsAsFactors = FALSE), res, row.names = NULL)
+  } else {
+    na_block <- as.data.frame(setNames(rep(list(NA), length(GO_OUT_COLS)), GO_OUT_COLS),
+                              stringsAsFactors = FALSE)
+    cbind(meta, data.frame(status = status, stringsAsFactors = FALSE), na_block, row.names = NULL)
+  }
+}
+
+read_drug_universe <- function(perturbation, drug_file_name, dirs) {
+  base_dir <- dirs[[perturbation]]
+  if (is.null(base_dir) || is.na(base_dir) || !dir.exists(base_dir))
+    return(list(ok = FALSE, reason = sprintf("perturbation '%s' has no resolvable dir", perturbation)))
+  fpath <- file.path(base_dir, drug_file_name)
+  if (!file.exists(fpath))
+    return(list(ok = FALSE, reason = sprintf("drug signature file not found: %s", fpath)))
+  dd <- suppressWarnings(readr::read_csv(fpath, show_col_types = FALSE))
+  if (!"Human_Ensembl" %in% names(dd))
+    return(list(ok = FALSE, reason = sprintf("no 'Human_Ensembl' column: %s", fpath)))
+  uni <- dd %>% filter(!is.na(Human_Ensembl)) %>% distinct(Human_Ensembl) %>% pull(Human_Ensembl)
+  list(ok = TRUE, universe = uni)
+}
+
+# -----------------------------------------------------------------------------
+# 4. PER-ROW WORKER FUNCTION (writes its own parts, flag last)
+# -----------------------------------------------------------------------------
+process_one_row <- function(row, dirs, parts_dir, P, Q, ONT, MINLE,
+                            up_col, dn_col, delim) {
+  rid <- row$row_id
+  meta <- data.frame(row_id = rid, perturbation = row$perturbation,
+                     Drug_Signature = row$Drug_Signature,
+                     Disease_Signature = row$Disease_Signature,
+                     Disease_Name = row$Disease_Name, stringsAsFactors = FALSE)
+
+  blocks <- list(); obj_list <- list(); notes <- character(0)
+  GO_OUT_COLS <- c("ID","Description","GeneRatio","BgRatio",
+                   "pvalue","p.adjust","qvalue","geneID","Count")
+
+  .split <- function(cell) {
+    if (is.na(cell) || trimws(cell) == "") return(character(0))
+    t <- trimws(strsplit(cell, delim, fixed = TRUE)[[1]]); t[t != ""]
+  }
+  .block <- function(m, status, eo = NULL) {
+    if (!is.null(eo) && nrow(as.data.frame(eo)) > 0) {
+      res <- as.data.frame(eo)[, GO_OUT_COLS, drop = FALSE]
+      cbind(m[rep(1, nrow(res)), , drop = FALSE],
+            data.frame(status = "enriched", stringsAsFactors = FALSE), res, row.names = NULL)
+    } else {
+      nb <- as.data.frame(setNames(rep(list(NA), length(GO_OUT_COLS)), GO_OUT_COLS),
+                          stringsAsFactors = FALSE)
+      cbind(m, data.frame(status = status, stringsAsFactors = FALSE), nb, row.names = NULL)
+    }
+  }
+
+  ur <- read_drug_universe(row$perturbation, row$Drug_Signature, dirs)
+  if (!isTRUE(ur$ok)) {
+    notes <- c(notes, sprintf("UNRESOLVED: %s", ur$reason))
+    for (dl in c("up","down")) {
+      m <- cbind(meta, data.frame(direction = dl, database = "GO_BP", stringsAsFactors = FALSE))
+      blocks[[length(blocks)+1]] <- .block(m, "unresolved_universe")
+    }
+  } else {
+    universe <- ur$universe
+    le_cols <- c(up = up_col, down = dn_col)
+    for (dl in names(le_cols)) {
+      genes <- .split(row[[ le_cols[[dl]] ]])
+      gin <- intersect(genes, universe)
+      m <- cbind(meta, data.frame(direction = dl, database = "GO_BP", stringsAsFactors = FALSE))
+      if (length(gin) < MINLE) {
+        notes <- c(notes, sprintf("%s: SKIPPED %d gene(s) in universe", dl, length(gin)))
+        blocks[[length(blocks)+1]] <- .block(m, "skipped_too_few_genes"); next
+      }
+      ego <- tryCatch(
+        clusterProfiler::enrichGO(gene = gin, universe = universe, OrgDb = org.Hs.eg.db,
+                                  keyType = "ENSEMBL", ont = ONT,
+                                  pvalueCutoff = P, qvalueCutoff = Q, readable = TRUE),
+        error = function(e) { notes <<- c(notes, sprintf("%s: enrichGO ERROR %s", dl, conditionMessage(e))); NULL })
+      if (is.null(ego)) { blocks[[length(blocks)+1]] <- .block(m, "enrichGO_error"); next }
+      obj_list[[paste(rid, dl, sep = "|")]] <- ego
+      blocks[[length(blocks)+1]] <-
+        if (nrow(as.data.frame(ego)) == 0) .block(m, "no_enrichment", ego) else .block(m, "enriched", ego)
+    }
+  }
+
+  tidy_row <- dplyr::bind_rows(blocks)
+  readr::write_csv(tidy_row, file.path(parts_dir, sprintf("ora_part_%d.csv", rid)))
+  saveRDS(obj_list,        file.path(parts_dir, sprintf("ora_obj_%d.rds",  rid)))
+  if (length(notes) > 0)
+    writeLines(paste0("[row ", rid, "] ", notes), file.path(parts_dir, sprintf("note_%d.txt", rid)))
+  writeLines(format(Sys.time()), file.path(parts_dir, sprintf("done_%d.flag", rid)))  # flag LAST
+  invisible(TRUE)
+}
+
+# -----------------------------------------------------------------------------
+# 5. PARALLEL RUN WITH PROGRESS BAR
+# -----------------------------------------------------------------------------
+if (nrow(todo_df) > 0) {
+  plan(multisession, workers = N_WORKERS)
+  # Use non-global progress handling (with_progress below). Do NOT call
+  # handlers(global = TRUE): in global mode progressr installs a calling handler
+  # on the session stack and errors ("should not be called with handlers on the
+  # stack") when re-run in the same session, inside knitr, or after an
+  # interrupted run. with_progress() is the safe, re-runnable idiom.
+  handlers("txtprogressbar")
+  row_list <- todo_df %>% group_split(row_id)
+
+  with_progress({
+    p <- progressor(steps = length(row_list))
+    future_walk(row_list, function(r) {
+      process_one_row(r, drug_sig_dirs, parts_dir, P_CUTOFF, Q_CUTOFF, GO_ONT,
+                      MIN_LE_GENES, LE_UP_COL, LE_DOWN_COL, LE_DELIM)
+      p()  # advance bar as each row completes
+    }, .options = furrr_options(seed = TRUE))
+  })
+  plan(sequential)
+  cat("\nDispatched rows complete.\n")
+} else {
+  cat("All rows were already complete; proceeding to reassembly.\n")
+}
+
+# -----------------------------------------------------------------------------
+# 6. REASSEMBLE FINAL OUTPUTS (only if everything is done)
+# -----------------------------------------------------------------------------
+n_done <- length(list.files(parts_dir, pattern = "^done_\\d+\\.flag$"))
+if (n_done < nrow(map_df)) {
+  cat(sprintf("\n%d / %d rows done. Re-run this chunk to finish the rest before reassembly.\n",
+              n_done, nrow(map_df)))
+} else {
+  cat("\nAll rows complete -- reassembling final outputs...\n")
+
+  part_csvs <- list.files(parts_dir, pattern = "^ora_part_\\d+\\.csv$", full.names = TRUE)
+  tidy_results <- part_csvs %>%
+    map(~ suppressWarnings(read_csv(.x, show_col_types = FALSE,
+                                    col_types = cols(.default = col_character())))) %>%
+    bind_rows()
+  for (cc in intersect(c("pvalue","p.adjust","qvalue","Count","row_id"), names(tidy_results)))
+    tidy_results[[cc]] <- suppressWarnings(as.numeric(tidy_results[[cc]]))
+  tidy_results <- tidy_results %>% arrange(row_id, direction, is.na(p.adjust), p.adjust)
+  write_csv(tidy_results, out_table_path)
+
+  part_rds <- list.files(parts_dir, pattern = "^ora_obj_\\d+\\.rds$", full.names = TRUE)
+  enrich_store <- list()
+  for (pp in part_rds) {
+    o <- tryCatch(readRDS(pp), error = function(e) NULL)
+    if (!is.null(o) && length(o) > 0) enrich_store <- c(enrich_store, o)
+  }
+  saveRDS(enrich_store, out_rds_path)
+
+  note_files <- list.files(parts_dir, pattern = "^note_\\d+\\.txt$", full.names = TRUE)
+  all_notes  <- if (length(note_files) > 0) unlist(lapply(note_files, readLines)) else character(0)
+  status_counts <- tidy_results %>% count(status, name = "n")
+
+  log_lines <- c("================ PER-ROW GO:BP ORA -- SUMMARY ================",
+    sprintf("Rows in table   : %d", nrow(map_df)),
+    sprintf("Tidy rows total : %d", nrow(tidy_results)),
+    sprintf("Raw objects     : %d", length(enrich_store)),
+    "", "--- Status breakdown (per direction-test) ---",
+    apply(status_counts, 1, function(r) sprintf("  %-22s %s", r[["status"]], r[["n"]])))
+  if (length(all_notes) > 0)
+    log_lines <- c(log_lines, "", sprintf("--- Worker notes (%d) ---", length(all_notes)), all_notes)
+  log_lines <- c(log_lines, "", "=============================================================")
+  writeLines(log_lines, out_log_path)
+  cat(paste(log_lines, collapse = "\n"), "\n")
+
+  cat(sprintf("\nFinal outputs written to:\n  %s\n  %s\n  %s\n",
+              out_table_path, out_rds_path, out_log_path))
+}
+
+
+# =============================================================================
+# Supplementary ORA table: top-3 GO:BP terms per direction, EVERY pair
+# -----------------------------------------------------------------------------
+# Wide layout: ONE ROW per (table row = drug/disease pair), with up1..up3 and
+# down1..down3 term blocks. Each term block carries:
+#     Description | pvalue | p.adjust | qvalue | Count
+# Terms are ranked by RAW pvalue (ascending) within each direction, pulled from
+# the FULL tested table in each saved enrichResult's @result slot (no rerun).
+#
+# Every pair is represented. A direction with no stored object / no tested terms
+# (e.g. skipped for too few genes) is marked "no terms tested" with blank stats.
+#
+# IMPORTANT framing: these are DESCRIPTIVE. p.adjust/qvalue are included so the
+# (generally non-FDR-significant) strength is transparent in the supplement.
+# =============================================================================
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(openxlsx)
+})
+
+# --- paths -------------------------------------------------------------------
+ora_dir  <- "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Figures/Supplement/Supplementary_Tables/ORA_GOBP_new"
+rds_path <- file.path(ora_dir, "PerRow_ORA_GOBP_enrichObjects_new.rds")
+out_xlsx <- file.path(ora_dir, "Supp_ORA_GOBP_Top3_perPair.xlsx")
+
+input_xlsx  <- "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/GLPsharedFolder/For_Sharing/Supplementary_Tables.xlsx"
+input_sheet <- "S3 Sema_Dox_Sglt2i_reversal"
+input_skip  <- 1
+
+TOP_N      <- 3
+NO_TERMS   <- "no terms tested"      # marker for empty/skipped directions
+ID_KEEP    <- c("perturbation", "Drug_Signature", "Disease_Signature",
+                "Disease_Name")      # pair-identifying cols carried through
+
+stopifnot(file.exists(rds_path), file.exists(input_xlsx))
+
+# --- 1. Table with row_id (reproduce the run's stamping exactly) -------------
+map_df <- read_excel(input_xlsx, sheet = input_sheet, skip = input_skip) %>%
+  mutate(row_id = row_number(), .before = 1)
+
+id_cols_present <- intersect(ID_KEEP, names(map_df))
+
+# --- 2. Saved enrichResult objects, keyed "row_id|direction" -----------------
+store <- readRDS(rds_path)
+
+# Top-N (by raw pvalue) terms from one object's FULL @result table.
+top_terms <- function(key, n = TOP_N) {
+  obj <- store[[key]]
+  if (is.null(obj)) return(NULL)
+  df <- obj@result
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  df %>%
+    as_tibble() %>%
+    arrange(pvalue, p.adjust) %>%
+    slice_head(n = n) %>%
+    dplyr::select(Description, pvalue, p.adjust, qvalue, Count)
+}
+
+# Flatten one direction's top-N into a single named wide row:
+#   <dir>1_Description, <dir>1_pvalue, ... <dir>N_Count
+# Missing slots (fewer than N terms, or none) are filled: first slot gets the
+# NO_TERMS marker when there were truly no terms; extra empty slots stay NA.
+flatten_dir <- function(tt, dir, n = TOP_N) {
+  out <- list()
+  for (i in seq_len(n)) {
+    pfx <- sprintf("%s%d_", dir, i)
+    if (!is.null(tt) && i <= nrow(tt)) {
+      out[[paste0(pfx, "Description")]] <- tt$Description[i]
+      out[[paste0(pfx, "pvalue")]]      <- tt$pvalue[i]
+      out[[paste0(pfx, "p.adjust")]]    <- tt$p.adjust[i]
+      out[[paste0(pfx, "qvalue")]]      <- tt$qvalue[i]
+      out[[paste0(pfx, "Count")]]       <- tt$Count[i]
+    } else {
+      out[[paste0(pfx, "Description")]] <-
+        if (is.null(tt) && i == 1) NO_TERMS else NA_character_
+      out[[paste0(pfx, "pvalue")]]   <- NA_real_
+      out[[paste0(pfx, "p.adjust")]] <- NA_real_
+      out[[paste0(pfx, "qvalue")]]   <- NA_real_
+      out[[paste0(pfx, "Count")]]    <- NA_integer_
+    }
+  }
+  as_tibble(out)
+}
+
+# --- 3. Build one wide row per pair ------------------------------------------
+wide_rows <- map_df %>%
+  mutate(.rn = row_number()) %>%
+  group_split(.rn) %>%
+  map_dfr(function(r) {
+    rid <- r$row_id
+    up_tt   <- top_terms(paste(rid, "up",   sep = "|"))
+    down_tt <- top_terms(paste(rid, "down", sep = "|"))
+    ids <- r %>% dplyr::select(row_id, all_of(id_cols_present))
+    bind_cols(ids, flatten_dir(up_tt, "up"), flatten_dir(down_tt, "down"))
+  })
+
+cat(sprintf("Built %d pair rows (cols: %d).\n", nrow(wide_rows), ncol(wide_rows)))
+
+# --- 4. Write a clean, formatted .xlsx ---------------------------------------
+wb <- createWorkbook()
+sheet_name <- "ORA_GOBP_Top3"
+addWorksheet(wb, sheet_name)
+
+# Round the numeric stat columns for readability (keep enough precision for
+# small p-values).
+num_cols <- grep("_(pvalue|p\\.adjust|qvalue)$", names(wide_rows), value = TRUE)
+for (cc in num_cols) wide_rows[[cc]] <- signif(wide_rows[[cc]], 3)
+
+writeData(wb, sheet_name, wide_rows, withFilter = TRUE)
+
+# Styling: professional font, bold header, frozen header + id columns.
+hdr <- createStyle(textDecoration = "bold", halign = "center",
+                   valign = "center", fgFill = "#D9E1F2",
+                   border = "bottom", fontName = "Arial")
+body <- createStyle(fontName = "Arial")
+addStyle(wb, sheet_name, body,
+         rows = 2:(nrow(wide_rows) + 1),
+         cols = 1:ncol(wide_rows), gridExpand = TRUE, stack = TRUE)
+addStyle(wb, sheet_name, hdr, rows = 1, cols = 1:ncol(wide_rows),
+         gridExpand = TRUE, stack = TRUE)
+
+# Freeze the header row and the leading id columns so term blocks scroll under
+# stable row labels.
+n_id <- 1 + length(id_cols_present)            # row_id + carried id cols
+freezePane(wb, sheet_name, firstActiveRow = 2, firstActiveCol = n_id + 1)
+
+# Column widths: id cols wider, Description cols wide, stats narrow.
+setColWidths(wb, sheet_name, cols = 1:n_id, widths = 18)
+desc_cols <- grep("_Description$", names(wide_rows))
+setColWidths(wb, sheet_name, cols = desc_cols, widths = 42)
+stat_cols <- grep("_(pvalue|p\\.adjust|qvalue|Count)$", names(wide_rows))
+setColWidths(wb, sheet_name, cols = stat_cols, widths = 11)
+
+# A short notes sheet documenting the method, so the supplement is self-explaining.
+addWorksheet(wb, "README")
+readme <- c(
+  "Top-3 GO:BP ORA terms per leading-edge pair (descriptive).",
+  "",
+  "Layout: one row per drug/disease pair. up1..up3 and down1..down3 are the",
+  "three top terms for the UP and DOWN leading edges, ranked by RAW p-value.",
+  "Each term block: Description, pvalue, p.adjust, qvalue, Count.",
+  "",
+  "Universe: per-row query set (disease |log2FC|>1 & padj<0.05, intersect drug",
+  "signature, cap 500/side; up union down). enrichGO keyType=ENSEMBL, ont=BP.",
+  "",
+  "IMPORTANT: terms are ranked by raw p-value for DESCRIPTION. They are largely",
+  "NOT FDR-significant (see p.adjust / qvalue columns). Do not describe them as",
+  "'significantly enriched'; describe as nominal/suggestive enrichment.",
+  "",
+  paste0("'", NO_TERMS, "' marks a direction with no tested terms (e.g. leading"),
+  "edge too small to test). Blank stat cells in later slots mean fewer than 3",
+  "terms were available for that direction."
+)
+writeData(wb, "README", data.frame(Notes = readme))
+setColWidths(wb, "README", cols = 1, widths = 90)
+addStyle(wb, "README", createStyle(fontName = "Arial"),
+         rows = 1:(length(readme) + 1), cols = 1, gridExpand = TRUE)
+
+saveWorkbook(wb, out_xlsx, overwrite = TRUE)
+cat(sprintf("Wrote: %s\n", out_xlsx))
+
