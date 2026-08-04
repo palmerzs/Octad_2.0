@@ -1,0 +1,166 @@
+
+# ==============================================================================
+# 1. SETUP & LIBRARIES
+# ==============================================================================
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(stringr)
+  library(readr)
+  library(tibble)
+  library(sigatlas) 
+})
+
+# --- CONFIGURATION ---
+CONFIG <- list(
+  # Input: Path to your generated TPM matrices
+  tpm_dir   = "C:/Documents/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/SingleCellDeconvolution/Tpm_matrices",
+  
+  # Input: Path to your metadata
+  meta_file = "C:/Documents/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Mouse_Signature_Metadata_Formatted.xlsx",
+  
+  # Output directory
+  out_dir   = "C:/Documents/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/SingleCellDeconvolution/SigatlasMice"
+)
+
+# Create Output Directory
+if(!dir.exists(CONFIG$out_dir)) dir.create(CONFIG$out_dir, recursive = TRUE)
+
+# ==============================================================================
+# 2. DEFINE HELPERS & VALID TISSUES
+# ==============================================================================
+
+# Official List from Sigatlas (Mouse)
+VALID_MOUSE_TISSUES <- c(
+  "Adipose", "Adrenal_gland", "Bladder", "Blood", "Bone_marrow", 
+  "Brain", "Breast", "Eye", "Gut", "Heart", "Intestine", 
+  "Kidney", "Liver", "Lung", "Muscle", "Omentum", "Ovary", 
+  "Pancreas", "Placenta", "Pleura", "Prostate", "Retina", 
+  "Skin", "Spleen", "Stomach", "Testis", "Thymus", "Uterus"
+)
+
+# Function to convert UPPERCASE (ARCHS4) -> Title Case (Mouse Standard)
+# Example: "GAPDH" -> "Gapdh"
+to_mouse_symbol <- function(x) {
+  s <- tolower(x)
+  paste0(toupper(substr(s, 1, 1)), substr(s, 2, nchar(s)))
+}
+
+# Function to Map Metadata Tissue -> Sigatlas Valid Tissue
+map_tissue_name <- function(raw_tissue) {
+  if (is.na(raw_tissue)) return(NA)
+  
+  # 1. Special Rule: Brain (handles "Brain: LS", "Frontal Cortex", etc.)
+  if (str_detect(raw_tissue, fixed("Brain", ignore_case=TRUE))) {
+    return("Brain")
+  }
+  
+  # 2. Special Rule: Adipose (handles "White Adipose Tissue", "BAT", etc.)
+  if (str_detect(raw_tissue, fixed("Adipose", ignore_case=TRUE))) {
+    return("Adipose")
+  }
+  
+  # 3. General Rule: Case-insensitive match against valid list
+  # Find index where valid list matches the input (ignoring case)
+  match_idx <- which(tolower(VALID_MOUSE_TISSUES) == tolower(raw_tissue))
+  
+  if (length(match_idx) > 0) {
+    return(VALID_MOUSE_TISSUES[match_idx[1]])
+  } else {
+    return(NA) # No match found
+  }
+}
+
+# ==============================================================================
+# 3. LOAD METADATA & PREPARE FILE LIST
+# ==============================================================================
+message("Loading Metadata...")
+meta <- read_excel(CONFIG$meta_file)
+
+# Get list of TPM files
+tpm_files <- list.files(CONFIG$tpm_dir, pattern = "_TPM.csv", full.names = TRUE)
+
+message(sprintf("Found %d TPM files to process.", length(tpm_files)))
+
+# ==============================================================================
+# 4. MAIN PROCESSING LOOP
+# ==============================================================================
+
+for (f_path in tpm_files) {
+  
+  # A. Identify the Job/Key from Filename
+  f_name <- basename(f_path)
+  key <- gsub("_TPM.csv", "", f_name)
+  
+  message(paste("\n-------------------------------------------"))
+  message(sprintf("Processing Key: %s", key))
+  
+  # B. Get Tissue from Metadata
+  # NAMESPACING FIX: using dplyr::filter and dplyr::slice
+  row_info <- meta %>% 
+    dplyr::filter(Key == key) %>% 
+    dplyr::slice(1)
+  
+  if (nrow(row_info) == 0) {
+    message("WARNING: Key not found in metadata. Skipping.")
+    next
+  }
+  
+  raw_tissue <- row_info$tissue
+  target_tissue <- map_tissue_name(raw_tissue)
+  
+  message(sprintf("   > Metadata Tissue: '%s' -> Mapped to: '%s'", raw_tissue, target_tissue))
+  
+  # Check Validity
+  if (is.na(target_tissue)) {
+    message(sprintf("   > WARNING: Could not map '%s' to a valid sigatlas tissue. Skipping.", raw_tissue))
+    next
+  }
+  
+  # C. Load Data & Format Genes
+  tryCatch({
+    # Read TPM (CSV has Gene_Symbol as col 1)
+    df <- read_csv(f_path, show_col_types = FALSE) 
+    
+    # Isolate Gene Column and Data
+    # NAMESPACING FIX: using dplyr::select
+    genes_upper <- df$Gene_Symbol
+    mat_data <- as.matrix(df %>% dplyr::select(-Gene_Symbol))
+    
+    # Convert Genes to Title Case (GAPDH -> Gapdh)
+    genes_title <- to_mouse_symbol(genes_upper)
+    
+    # Assign rownames
+    rownames(mat_data) <- genes_title
+    
+    # Handle Duplicates (Collision Handling)
+    if(any(duplicated(rownames(mat_data)))) {
+      message("   > Duplicate gene symbols found after renaming. Aggregating...")
+      mat_data <- rowsum(mat_data, group = rownames(mat_data))
+    }
+    
+    message(sprintf("   > Matrix Ready: %d Genes x %d Samples", nrow(mat_data), ncol(mat_data)))
+    
+    # D. Run Sigatlas
+    scores <- sigatlas(
+      expr = mat_data, 
+      tissue = target_tissue, 
+      organism = "Mouse"
+    )
+    
+    # E. Save Results
+    out_file <- file.path(CONFIG$out_dir, paste0("sigatlas_", key, ".csv"))
+    write.csv(scores, out_file)
+    
+    message(sprintf("SUCCESS: Saved results to %s", basename(out_file)))
+    
+  }, error = function(e) {
+    message(sprintf("ERROR processing %s: %s", key, e$message))
+  })
+}
+
+message("\nAll Done! Check the output folder.")
+
+
+
+
