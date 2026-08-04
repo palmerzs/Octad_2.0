@@ -1,0 +1,393 @@
+
+# ============================================================
+# SEMAGLUTIDE NETWORK PROXIMITY ANALYSIS — DE GENES VERSION
+# Full pipeline: setup + main run + sensitivity analysis
+# Reconstructed from session history
+# ============================================================
+
+
+# --- 1. LIBRARIES AND DIRECTORIES -------------------------------------------
+
+library(readr)
+library(dplyr)
+library(igraph)
+library(STRINGdb)
+library(doParallel)
+library(foreach)
+library(tictoc)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# Update these paths as needed
+prox_dir     <- "E:/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Reversal2.4.2026Signatures/Proximity"
+string_cache <- "E:/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/string_cache"
+
+dir.create(prox_dir,     recursive = TRUE, showWarnings = FALSE)
+dir.create(string_cache, recursive = TRUE, showWarnings = FALSE)
+
+disease_base <- "E:/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/DzSignatures2.4.2026/signatures_new"
+drug_base    <- "E:/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/DE_signatures_Standardized"
+
+cat("Directories ready\n")
+
+
+# --- 2. LOAD REVERSAL FILE --------------------------------------------------
+
+reversal <- read_csv(
+  "E:/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Reversal2.4.2026Signatures/Semaglutide_Reversal_Scores_2026_postAnnotationsBackup.csv",
+  show_col_types = FALSE
+)
+cat("Reversal file loaded:", nrow(reversal), "pairs\n")
+
+
+# --- 3. STRING GRAPH --------------------------------------------------------
+
+string_graph_path <- file.path(prox_dir, "string_graph.rds")
+
+if (file.exists(string_graph_path)) {
+  cat("Loading STRING graph from cache...\n")
+  string_graph <- readRDS(string_graph_path)
+} else {
+  cat("Downloading STRING graph...\n")
+  string_db    <- STRINGdb$new(
+    version         = "12.0",
+    species         = 9606,
+    score_threshold = 400,
+    input_directory = string_cache
+  )
+  string_graph <- string_db$get_graph()
+  saveRDS(string_graph, string_graph_path)
+  cat("STRING graph saved\n")
+}
+
+cat("Nodes:", igraph::vcount(string_graph), "\n")
+cat("Edges:", igraph::ecount(string_graph), "\n")
+
+
+# --- 4. HELPER FUNCTIONS ----------------------------------------------------
+
+get_disease_folder <- function(filename) sub("_.*", "", filename)
+
+# Return all significant DE genes sorted by |log2FC| descending
+# Drug side: uses log2FoldChange and padj, returns Human_Ensembl
+get_drug_de_genes <- function(sig) {
+  sig <- sig[!is.na(sig$padj) &
+             !is.na(sig$log2FoldChange) &
+             !is.na(sig$Human_Ensembl), ]
+  sig <- sig[sig$padj < 0.05, ]
+  if (nrow(sig) == 0) return(character(0))
+  sig <- sig[order(abs(sig$log2FoldChange), decreasing = TRUE), ]
+  sig$Human_Ensembl
+}
+
+# Disease side: uses log2FoldChange and padj, returns identifier (ENSG)
+get_disease_de_genes <- function(sig) {
+  sig <- sig[!is.na(sig$padj) &
+             !is.na(sig$log2FoldChange) &
+             !is.na(sig$identifier), ]
+  sig <- sig[sig$padj < 0.05, ]
+  if (nrow(sig) == 0) return(character(0))
+  sig <- sig[order(abs(sig$log2FoldChange), decreasing = TRUE), ]
+  sig$identifier
+}
+
+extract_de_ensg_ids <- function(sig_name, type) {
+  if (type == "drug") {
+    df   <- read_csv(file.path(drug_base, sig_name), show_col_types = FALSE)
+    ensg <- get_drug_de_genes(df)
+  } else {
+    path <- file.path(disease_base, get_disease_folder(sig_name), sig_name)
+    df   <- read_csv(path, show_col_types = FALSE)
+    ensg <- get_disease_de_genes(df)
+  }
+  unique(ensg)
+}
+
+
+# --- 5. ENSG TO STRING MAP --------------------------------------------------
+# Built from DE genes only — safe to rerun, loads from cache if available
+
+map_path <- file.path(prox_dir, "ensg_to_string_map_DE.rds")
+
+if (file.exists(map_path)) {
+  cat("Loading ENSG to STRING map from cache...\n")
+  ensg_to_string_map <- readRDS(map_path)
+} else {
+  cat("Collecting all unique DE ENSG IDs...\n")
+  unique_drug_sigs    <- unique(reversal$Drug_Signature)
+  unique_disease_sigs <- unique(reversal$Disease_Signature)
+
+  all_drug_ensg    <- unique(unlist(lapply(unique_drug_sigs,
+                                           extract_de_ensg_ids, type = "drug")))
+  all_disease_ensg <- unique(unlist(lapply(unique_disease_sigs,
+                                           extract_de_ensg_ids, type = "disease")))
+  all_ensg         <- unique(c(all_drug_ensg, all_disease_ensg))
+  cat("Total unique DE ENSG IDs:", length(all_ensg), "\n")
+
+  cat("Batch mapping ENSG to Symbol...\n")
+  symbol_map    <- mapIds(org.Hs.eg.db,
+                          keys      = all_ensg,
+                          column    = "SYMBOL",
+                          keytype   = "ENSEMBL",
+                          multiVals = "first")
+  valid_symbols <- symbol_map[!is.na(symbol_map)]
+  sym_df        <- data.frame(
+    symbol           = as.character(valid_symbols),
+    ensg             = names(valid_symbols),
+    stringsAsFactors = FALSE
+  )
+
+  cat("Batch mapping Symbol to STRING ID...\n")
+  string_db <- STRINGdb$new(
+    version         = "12.0",
+    species         = 9606,
+    score_threshold = 400,
+    input_directory = string_cache
+  )
+  sym_mapped         <- string_db$map(sym_df, "symbol", removeUnmappedRows = TRUE)
+  ensg_to_string_map <- setNames(sym_mapped$STRING_id, sym_mapped$ensg)
+
+  saveRDS(ensg_to_string_map, map_path)
+  cat("Map saved:", length(ensg_to_string_map), "mappings\n")
+}
+
+cat("ENSG to STRING mappings available:", length(ensg_to_string_map), "\n")
+
+
+# --- 6. BUILD GENE SETS -----------------------------------------------------
+
+lookup_string_ids <- function(ensg_ids) {
+  ids <- ensg_to_string_map[ensg_ids]
+  unique(ids[!is.na(ids)])
+}
+
+# Each signature returns list(N5, N10, N20) of STRING IDs
+# Returns empty character(0) for each if no significant DE genes
+build_de_gene_set <- function(sig_name, type) {
+  if (type == "drug") {
+    df   <- read_csv(file.path(drug_base, sig_name), show_col_types = FALSE)
+    ensg <- get_drug_de_genes(df)
+  } else {
+    path <- file.path(disease_base, get_disease_folder(sig_name), sig_name)
+    df   <- read_csv(path, show_col_types = FALSE)
+    ensg <- get_disease_de_genes(df)
+  }
+
+  if (length(ensg) == 0) {
+    return(list(N5  = character(0),
+                N10 = character(0),
+                N20 = character(0)))
+  }
+
+  string_ids <- lookup_string_ids(ensg)
+
+  list(
+    N5  = head(string_ids, 5),
+    N10 = head(string_ids, 10),
+    N20 = head(string_ids, 20)
+  )
+}
+
+drug_sets_path    <- file.path(prox_dir, "drug_gene_sets_DE.rds")
+disease_sets_path <- file.path(prox_dir, "disease_gene_sets_DE.rds")
+
+if (file.exists(drug_sets_path)) {
+  cat("Loading drug gene sets from cache...\n")
+  drug_gene_sets <- readRDS(drug_sets_path)
+} else {
+  cat("Building drug gene sets...\n")
+  unique_drug_sigs <- unique(reversal$Drug_Signature)
+  drug_gene_sets   <- lapply(
+    setNames(unique_drug_sigs, unique_drug_sigs),
+    build_de_gene_set, type = "drug"
+  )
+  saveRDS(drug_gene_sets, drug_sets_path)
+  cat("Drug gene sets saved\n")
+}
+
+if (file.exists(disease_sets_path)) {
+  cat("Loading disease gene sets from cache...\n")
+  disease_gene_sets <- readRDS(disease_sets_path)
+} else {
+  cat("Building disease gene sets...\n")
+  unique_disease_sigs <- unique(reversal$Disease_Signature)
+  disease_gene_sets   <- lapply(
+    setNames(unique_disease_sigs, unique_disease_sigs),
+    build_de_gene_set, type = "disease"
+  )
+  saveRDS(disease_gene_sets, disease_sets_path)
+  cat("Disease gene sets saved\n")
+}
+
+cat("Drug sets cached:",    length(drug_gene_sets),    "\n")
+cat("Disease sets cached:", length(disease_gene_sets), "\n")
+
+# Audit: how many signatures have zero DE genes?
+drug_empty    <- sum(sapply(drug_gene_sets,    function(x) length(x$N20) == 0))
+disease_empty <- sum(sapply(disease_gene_sets, function(x) length(x$N20) == 0))
+cat(sprintf("Drug signatures with no DE genes:    %d / %d\n",
+            drug_empty, length(drug_gene_sets)))
+cat(sprintf("Disease signatures with no DE genes: %d / %d\n",
+            disease_empty, length(disease_gene_sets)))
+
+
+# --- 7. DEGREE DATAFRAME ----------------------------------------------------
+
+degree_df_path <- file.path(prox_dir, "degree_df.rds")
+
+if (file.exists(degree_df_path)) {
+  cat("Loading degree dataframe from cache...\n")
+  degree_df <- readRDS(degree_df_path)
+} else {
+  cat("Building degree dataframe...\n")
+  node_degrees <- igraph::degree(string_graph)
+  degree_df    <- data.frame(
+    node             = names(node_degrees),
+    degree           = as.integer(node_degrees),
+    stringsAsFactors = FALSE
+  )
+  degree_df$bin <- cut(
+    degree_df$degree,
+    breaks         = quantile(degree_df$degree, probs = seq(0, 1, 0.05)),
+    include.lowest = TRUE,
+    labels         = FALSE
+  )
+  saveRDS(degree_df, degree_df_path)
+  cat("Degree dataframe saved\n")
+}
+cat("Degree dataframe rows:", nrow(degree_df), "\n")
+
+
+# --- 8. PROXIMITY FUNCTION --------------------------------------------------
+
+compute_proximity_fast <- function(graph, set_a, set_b) {
+  nodes <- igraph::V(graph)$name
+  set_a <- intersect(set_a, nodes)
+  set_b <- intersect(set_b, nodes)
+  if (length(set_a) == 0 || length(set_b) == 0) return(NA_real_)
+  dist_mat <- igraph::distances(graph, v = set_a, to = set_b)
+  d_ab <- mean(apply(dist_mat, 1, function(x) {
+    v <- x[is.finite(x)]; if (length(v) == 0) NA else min(v)
+  }), na.rm = TRUE)
+  d_ba <- mean(apply(dist_mat, 2, function(x) {
+    v <- x[is.finite(x)]; if (length(v) == 0) NA else min(v)
+  }), na.rm = TRUE)
+  (d_ab + d_ba) / 2
+}
+
+cat("\nAll objects ready. Proceeding to main run.\n")
+
+
+# ============================================================
+# MAIN RUN
+# ============================================================
+
+reversal_output_path <- file.path(prox_dir, "Semaglutide_Proximity_DE_Results.csv")
+checkpoint_path      <- file.path(prox_dir, "proximity_DE_checkpoint.rds")
+temp_csv_path        <- paste0(reversal_output_path, ".tmp")
+
+if (file.exists(checkpoint_path)) {
+  completed <- readRDS(checkpoint_path)
+  cat("Resuming from checkpoint:", nrow(completed), "pairs done\n")
+} else {
+  completed <- NULL
+  cat("Starting fresh\n")
+}
+
+done_idx      <- if (!is.null(completed)) completed$row_idx else integer(0)
+remaining_idx <- setdiff(1:nrow(reversal), done_idx)
+cat("Pairs remaining:", length(remaining_idx), "\n")
+
+chunk_size <- 500
+chunks     <- split(remaining_idx,
+                    ceiling(seq_along(remaining_idx) / chunk_size))
+
+n_cores <- max(1, detectCores() - 4)
+cat("Running on", n_cores, "cores\n")
+
+tic()
+for (chunk_i in seq_along(chunks)) {
+  idx <- chunks[[chunk_i]]
+
+  # Fresh cluster each chunk to prevent memory accumulation
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  clusterExport(cl, varlist = c(
+    "string_graph", "drug_gene_sets", "disease_gene_sets",
+    "compute_proximity_fast", "reversal"
+  ))
+  clusterEvalQ(cl, library(igraph))
+
+  chunk_results <- foreach(
+    i         = idx,
+    .combine  = rbind,
+    .packages = "igraph"
+  ) %dopar% {
+    tryCatch({
+      row <- reversal[i, ]
+
+      drug_N5  <- drug_gene_sets[[row$Drug_Signature]]$N5
+      drug_N10 <- drug_gene_sets[[row$Drug_Signature]]$N10
+      drug_N20 <- drug_gene_sets[[row$Drug_Signature]]$N20
+      dis_N5   <- disease_gene_sets[[row$Disease_Signature]]$N5
+      dis_N10  <- disease_gene_sets[[row$Disease_Signature]]$N10
+      dis_N20  <- disease_gene_sets[[row$Disease_Signature]]$N20
+
+      score_N5  <- if (length(drug_N5)  > 0 & length(dis_N5)  > 0)
+        compute_proximity_fast(string_graph, drug_N5,  dis_N5)  else NA_real_
+      score_N10 <- if (length(drug_N10) > 0 & length(dis_N10) > 0)
+        compute_proximity_fast(string_graph, drug_N10, dis_N10) else NA_real_
+      score_N20 <- if (length(drug_N20) > 0 & length(dis_N20) > 0)
+        compute_proximity_fast(string_graph, drug_N20, dis_N20) else NA_real_
+
+      data.frame(
+        row_idx           = i,
+        Drug_Signature    = row$Drug_Signature,
+        Disease_Signature = row$Disease_Signature,
+        Proximity_N5      = score_N5,
+        Proximity_N10     = score_N10,
+        Proximity_N20     = score_N20,
+        stringsAsFactors  = FALSE
+      )
+    }, error = function(e) {
+      data.frame(
+        row_idx           = i,
+        Drug_Signature    = reversal$Drug_Signature[i],
+        Disease_Signature = reversal$Disease_Signature[i],
+        Proximity_N5      = NA_real_,
+        Proximity_N10     = NA_real_,
+        Proximity_N20     = NA_real_,
+        stringsAsFactors  = FALSE
+      )
+    })
+  }
+
+  stopCluster(cl)
+  gc()
+
+  completed <- rbind(completed, chunk_results)
+  saveRDS(completed, checkpoint_path)
+
+  reversal_out <- reversal %>%
+    dplyr::mutate(row_idx = dplyr::row_number()) %>%
+    dplyr::left_join(
+      completed %>% dplyr::select(row_idx, Proximity_N5, Proximity_N10, Proximity_N20),
+      by = "row_idx"
+    ) %>%
+    dplyr::select(-row_idx)
+
+  write_csv(reversal_out, temp_csv_path)
+  file.rename(temp_csv_path, reversal_output_path)
+
+  elapsed    <- toc(quiet = TRUE)$toc
+  pairs_done <- nrow(completed)
+  eta        <- (elapsed / pairs_done) * (nrow(reversal) - pairs_done) / 60
+  cat(sprintf(
+    "Chunk %d/%d | Completed: %d/%d | Elapsed: %.1f min | ETA: %.1f min\n",
+    chunk_i, length(chunks), pairs_done, nrow(reversal),
+    elapsed / 60, eta
+  ))
+}
+
+cat("Run complete. Output saved to:", reversal_output_path, "\n")
+
