@@ -1,0 +1,322 @@
+
+# ==============================================================================
+# 1. SETUP & LIBRARIES
+# ==============================================================================
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(stringr)
+  library(readr)
+  library(tibble)
+  library(sigatlas)
+})
+
+# --- ANALYSIS ROOT (new directory holding everything) ---
+ROOT <- "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Deconvolution_Comparison"
+
+# --- PER-ARM CONFIGURATION ---
+# Each arm needs: a folder of *_TPM.csv matrices, a metadata xlsx with Key + tissue,
+# and an output folder (created automatically under ROOT).
+ARMS <- list(
+
+  semaglutide = list(
+    tpm_dir   = "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab/semaglutide_project/Full_Survey_Semaglutide/SingleCellDeconvolution/Tpm_matrices",
+    meta_file = "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab/semaglutide_project/Full_Survey_Semaglutide/Mouse_Signature_Metadata_Formatted.xlsx",
+    out_dir   = file.path(ROOT, "semaglutide")
+  ),
+
+  sglt2i = list(
+    tpm_dir   = "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab/semaglutide_project/Full_Survey_Semaglutide/SGLT2is/sglt2i_deconvolution/Tpm_matrices",
+    meta_file = "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab/semaglutide_project/Full_Survey_Semaglutide/SGLT2is/sglt2i_deconvolution/signature_catalogue.csv",
+    out_dir   = file.path(ROOT, "sglt2i")
+  )
+)
+
+if (!dir.exists(ROOT)) dir.create(ROOT, recursive = TRUE)
+
+# ==============================================================================
+# 2. DEFINE HELPERS & VALID TISSUES
+# ==============================================================================
+
+# Official List from Sigatlas (Mouse)
+VALID_MOUSE_TISSUES <- c(
+  "Adipose", "Adrenal_gland", "Bladder", "Blood", "Bone_marrow",
+  "Brain", "Breast", "Eye", "Gut", "Heart", "Intestine",
+  "Kidney", "Liver", "Lung", "Muscle", "Omentum", "Ovary",
+  "Pancreas", "Placenta", "Pleura", "Prostate", "Retina",
+  "Skin", "Spleen", "Stomach", "Testis", "Thymus", "Uterus"
+)
+
+# Function to convert UPPERCASE (ARCHS4) -> Title Case (Mouse Standard)
+# Example: "GAPDH" -> "Gapdh"
+to_mouse_symbol <- function(x) {
+  s <- tolower(x)
+  paste0(toupper(substr(s, 1, 1)), substr(s, 2, nchar(s)))
+}
+
+# Function to Map Metadata Tissue -> Sigatlas Valid Tissue
+map_tissue_name <- function(raw_tissue) {
+  if (is.na(raw_tissue)) return(NA)
+
+  # 1. Special Rule: Brain (handles "Brain: LS", "Frontal Cortex", etc.)
+  if (str_detect(raw_tissue, fixed("Brain", ignore_case=TRUE))) {
+    return("Brain")
+  }
+
+  # 2. Special Rule: Adipose (handles "White Adipose Tissue", "BAT", etc.)
+  if (str_detect(raw_tissue, fixed("Adipose", ignore_case=TRUE))) {
+    return("Adipose")
+  }
+
+  # 3. General Rule: Case-insensitive match against valid list
+  match_idx <- which(tolower(VALID_MOUSE_TISSUES) == tolower(raw_tissue))
+
+  if (length(match_idx) > 0) {
+    return(VALID_MOUSE_TISSUES[match_idx[1]])
+  } else {
+    return(NA) # No match found
+  }
+}
+
+# ==============================================================================
+# 3. PER-ARM PROCESSING FUNCTION
+# ------------------------------------------------------------------------------
+# Runs the identical deconvolution logic for one drug arm.
+# ==============================================================================
+run_arm <- function(arm_name, cfg) {
+
+  message(paste0("\n===========================================",
+                 "\n=== ARM: ", arm_name,
+                 "\n==========================================="))
+
+  if (!dir.exists(cfg$out_dir)) dir.create(cfg$out_dir, recursive = TRUE)
+
+  # Load metadata (supports .xlsx or .csv so either arm's format works)
+  message("Loading Metadata...")
+  if (grepl("\\.xlsx?$", cfg$meta_file, ignore.case = TRUE)) {
+    meta <- read_excel(cfg$meta_file)
+  } else {
+    meta <- read_csv(cfg$meta_file, show_col_types = FALSE)
+  }
+
+  if (!all(c("Key", "tissue") %in% colnames(meta))) {
+    stop(sprintf("[%s] metadata must contain 'Key' and 'tissue' columns. Found: %s",
+                 arm_name, paste(colnames(meta), collapse = ", ")))
+  }
+
+  # Get list of TPM files
+  tpm_files <- list.files(cfg$tpm_dir, pattern = "_TPM.csv", full.names = TRUE)
+  message(sprintf("Found %d TPM files to process.", length(tpm_files)))
+
+  # ----------------------------------------------------------------------------
+  # MAIN PROCESSING LOOP
+  # ----------------------------------------------------------------------------
+  for (f_path in tpm_files) {
+
+    # A. Identify the Job/Key from Filename
+    f_name <- basename(f_path)
+    key <- gsub("_TPM.csv", "", f_name)
+
+    message(paste("\n-------------------------------------------"))
+    message(sprintf("Processing Key: %s", key))
+
+    # B. Get Tissue from Metadata
+    row_info <- meta %>%
+      dplyr::filter(Key == key) %>%
+      dplyr::slice(1)
+
+    if (nrow(row_info) == 0) {
+      message("WARNING: Key not found in metadata. Skipping.")
+      next
+    }
+
+    raw_tissue <- row_info$tissue
+    target_tissue <- map_tissue_name(raw_tissue)
+
+    message(sprintf("   > Metadata Tissue: '%s' -> Mapped to: '%s'", raw_tissue, target_tissue))
+
+    # Check Validity
+    if (is.na(target_tissue)) {
+      message(sprintf("   > WARNING: Could not map '%s' to a valid sigatlas tissue. Skipping.", raw_tissue))
+      next
+    }
+
+    # C. Load Data & Format Genes
+    tryCatch({
+      # Read TPM (CSV has Gene_Symbol as col 1)
+      df <- read_csv(f_path, show_col_types = FALSE)
+
+      # Isolate Gene Column and Data
+      genes_upper <- df$Gene_Symbol
+      mat_data <- as.matrix(df %>% dplyr::select(-Gene_Symbol))
+
+      # Convert Genes to Title Case (GAPDH -> Gapdh)
+      genes_title <- to_mouse_symbol(genes_upper)
+
+      # Assign rownames
+      rownames(mat_data) <- genes_title
+
+      # Handle Duplicates (Collision Handling)
+      if(any(duplicated(rownames(mat_data)))) {
+        message("   > Duplicate gene symbols found after renaming. Aggregating...")
+        mat_data <- rowsum(mat_data, group = rownames(mat_data))
+      }
+
+      message(sprintf("   > Matrix Ready: %d Genes x %d Samples", nrow(mat_data), ncol(mat_data)))
+
+      # D. Run Sigatlas
+      scores <- sigatlas(
+        expr = mat_data,
+        tissue = target_tissue,
+        organism = "Mouse"
+      )
+
+      # E. Save Results
+      out_file <- file.path(cfg$out_dir, paste0("sigatlas_", key, ".csv"))
+      write.csv(scores, out_file)
+
+      message(sprintf("SUCCESS: Saved results to %s", basename(out_file)))
+
+    }, error = function(e) {
+      message(sprintf("ERROR processing %s: %s", key, e$message))
+    })
+  }
+
+  message(sprintf("\n[%s] Done. Results in: %s", arm_name, cfg$out_dir))
+}
+
+# ==============================================================================
+# 4. PREFLIGHT CHECKS
+# ------------------------------------------------------------------------------
+# Confirms each arm's inputs are not just present but actually usable:
+#   - tpm_dir exists and contains *_TPM.csv files
+#   - meta_file exists, is readable, and has Key + tissue columns
+#   - the Keys in metadata overlap the TPM filenames (catches silent skips)
+#   - the first TPM file has a Gene_Symbol column
+# Halts before running if any arm has a critical failure.
+# ==============================================================================
+preflight_arm <- function(arm_name, cfg) {
+  cat(sprintf("\n--- Preflight: %s ---\n", arm_name))
+  problems <- character(0)
+  ok <- function(msg) cat(sprintf("  [OK]   %s\n", msg))
+  bad <- function(msg) { cat(sprintf("  [FAIL] %s\n", msg)); problems <<- c(problems, msg) }
+  warn <- function(msg) cat(sprintf("  [WARN] %s\n", msg))
+
+  # 1. TPM dir + files
+  tpm_files <- character(0)
+  if (!dir.exists(cfg$tpm_dir)) {
+    bad(sprintf("tpm_dir does not exist: %s", cfg$tpm_dir))
+  } else {
+    tpm_files <- list.files(cfg$tpm_dir, pattern = "_TPM.csv", full.names = TRUE)
+    if (length(tpm_files) == 0) {
+      bad(sprintf("tpm_dir exists but contains no *_TPM.csv files: %s", cfg$tpm_dir))
+    } else {
+      ok(sprintf("Found %d *_TPM.csv files in tpm_dir", length(tpm_files)))
+    }
+  }
+
+  # 2. Metadata file readable + columns
+  meta <- NULL
+  if (!file.exists(cfg$meta_file)) {
+    bad(sprintf("meta_file does not exist: %s", cfg$meta_file))
+  } else {
+    meta <- tryCatch({
+      if (grepl("\\.xlsx?$", cfg$meta_file, ignore.case = TRUE))
+        read_excel(cfg$meta_file)
+      else
+        read_csv(cfg$meta_file, show_col_types = FALSE)
+    }, error = function(e) { bad(sprintf("meta_file unreadable: %s", e$message)); NULL })
+
+    if (!is.null(meta)) {
+      missing_cols <- setdiff(c("Key", "tissue"), colnames(meta))
+      if (length(missing_cols) > 0) {
+        bad(sprintf("meta_file missing column(s): %s  (has: %s)",
+                    paste(missing_cols, collapse = ", "),
+                    paste(colnames(meta), collapse = ", ")))
+      } else {
+        ok(sprintf("meta_file readable with Key + tissue (%d rows)", nrow(meta)))
+      }
+    }
+  }
+
+  # 3. Key overlap between metadata and TPM filenames
+  if (!is.null(meta) && "Key" %in% colnames(meta) && length(tpm_files) > 0) {
+    file_keys <- gsub("_TPM.csv", "", basename(tpm_files))
+    meta_keys <- as.character(meta$Key)
+
+    matched     <- intersect(file_keys, meta_keys)
+    no_meta     <- setdiff(file_keys, meta_keys)   # TPM file but no metadata row -> skipped
+    no_tpm      <- setdiff(meta_keys, file_keys)   # metadata row but no TPM file -> not run
+
+    if (length(matched) == 0) {
+      bad("ZERO Keys match between TPM filenames and metadata 'Key' column. Every file would be skipped.")
+    } else {
+      ok(sprintf("%d/%d TPM files have a matching metadata Key", length(matched), length(file_keys)))
+    }
+    if (length(no_meta) > 0) {
+      warn(sprintf("%d TPM file(s) have NO metadata row (will be skipped): %s",
+                   length(no_meta),
+                   paste(utils::head(no_meta, 5), collapse = ", ")))
+    }
+    if (length(no_tpm) > 0) {
+      warn(sprintf("%d metadata Key(s) have NO TPM file (won't run): %s",
+                   length(no_tpm),
+                   paste(utils::head(no_tpm, 5), collapse = ", ")))
+    }
+
+    # 3b. Do the matched tissues actually map to valid sigatlas tissues?
+    if (length(matched) > 0) {
+      tcheck <- meta %>% dplyr::filter(Key %in% matched)
+      mapped <- vapply(tcheck$tissue, function(t) !is.na(map_tissue_name(t)), logical(1))
+      n_unmap <- sum(!mapped)
+      if (n_unmap > 0) {
+        warn(sprintf("%d matched signature(s) have a tissue that won't map to sigatlas (will be skipped): %s",
+                     n_unmap,
+                     paste(utils::head(unique(tcheck$tissue[!mapped]), 5), collapse = ", ")))
+      } else {
+        ok("All matched signatures have a mappable tissue")
+      }
+    }
+  }
+
+  # 4. First TPM file has Gene_Symbol column
+  if (length(tpm_files) > 0) {
+    hdr <- tryCatch(names(read_csv(tpm_files[1], n_max = 0, show_col_types = FALSE)),
+                    error = function(e) character(0))
+    if (!"Gene_Symbol" %in% hdr) {
+      bad(sprintf("First TPM file lacks a 'Gene_Symbol' column: %s", basename(tpm_files[1])))
+    } else {
+      ok("TPM files have a Gene_Symbol column")
+    }
+  }
+
+  invisible(problems)
+}
+
+cat("\n==========================================")
+cat("\n=== PREFLIGHT (no deconvolution yet) ===")
+cat("\n==========================================\n")
+
+all_problems <- list()
+for (arm_name in names(ARMS)) {
+  all_problems[[arm_name]] <- preflight_arm(arm_name, ARMS[[arm_name]])
+}
+
+n_fail <- sum(vapply(all_problems, length, integer(1)))
+if (n_fail > 0) {
+  cat(sprintf("\nPreflight found %d critical problem(s). Fix the [FAIL] items above before running.\n", n_fail))
+  stop("Preflight failed. Deconvolution not started.")
+} else {
+  cat("\nPreflight passed for all arms. Proceeding to deconvolution.\n")
+}
+
+# ==============================================================================
+# 5. RUN BOTH ARMS
+# ==============================================================================
+for (arm_name in names(ARMS)) {
+  run_arm(arm_name, ARMS[[arm_name]])
+}
+
+message("\nAll arms complete! Check each arm's output folder under:\n  ", ROOT)
+
+
