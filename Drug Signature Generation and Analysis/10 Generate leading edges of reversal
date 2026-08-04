@@ -1,0 +1,552 @@
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+
+# -----------------------------------------------------------------------------
+# 0. CONFIG  --  EDIT THESE IF ANY PATH IS WRONG
+# -----------------------------------------------------------------------------
+
+chenlab_root <- "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab"
+
+supp_dir <- file.path(
+  chenlab_root,
+  "semaglutide_project/Full_Survey_Semaglutide/Figures/Supplement/Supplementary_Tables"
+)
+
+input_map_path  <- file.path(supp_dir, "Supplementary_Tables.csv")
+output_map_path <- file.path(supp_dir, "Supplementary_Tables_withLeadingEdge2.csv")
+report_path     <- file.path(supp_dir, "LeadingEdge_ScoreReconciliation_Report2.txt")
+
+# Per-perturbation drug-signature directories (note the casing difference on
+# the Semaglutide folder; resolved case-insensitively below as a safety net).
+fss <- file.path(chenlab_root, "semaglutide_project/Full_Survey_Semaglutide")
+
+drug_sig_dirs <- c(
+  "Semaglutide"     = file.path(fss, "DE_signatures_Standardized"),
+  "SGLT2_Inhibitor" = file.path(fss, "SGLT2is/DE_Signatures_Standardized"),
+  "Doxorubicin"     = file.path(fss, "Doxorubicin/DE_Signatures_Standardized")
+)
+
+# Disease signatures: <disease_sig_dir>/<Disease_Name>/<Disease_Signature>
+disease_sig_dir <- file.path(fss, "DzSignatures2.4.2026/signatures_new")
+
+# Score reconciliation tolerance (absolute). Below this = floating-point /
+# tie noise; at or above = a real ("material") difference worth investigating.
+SCORE_TOL <- 1e-8
+
+# Serialization delimiter for the gene lists (must NOT be a comma).
+LE_DELIM <- ";"
+
+# --- METHOD C PARAMETERS ------------------------------------------------------
+# Fraction of the KS gap the reported leading edge must cumulatively cover.
+# 0.90 = "smallest set of genes explaining 90% of the score".
+LE_CONTRIB_FRAC <- 0.95
+
+# Tolerance for the internal assertion that per-gene contributions telescope
+# to the KS value. This is a correctness self-check, not a scoring tolerance.
+LE_TELESCOPE_TOL <- 1e-9
+# -----------------------------------------------------------------------------
+
+select_cumulative <- function(contrib, gap, frac) {
+  if (length(contrib) == 0) return(integer(0))
+  if (!is.finite(gap) || gap == 0) return(seq_along(contrib))
+  target <- frac * gap
+  ord <- order(contrib, decreasing = TRUE)      # most responsible first
+  cum <- cumsum(contrib[ord])
+  # first position where cumulative >= target
+  hit <- which(cum >= target)
+  k   <- if (length(hit) == 0) length(contrib) else hit[1]
+  sort(ord[seq_len(k)])                          # back to ascending block order
+}
+
+ks_arm_with_leading_edge <- function(tags_position_sorted, num_genes,
+                                     contrib_frac = LE_CONTRIB_FRAC) {
+  n <- length(tags_position_sorted)
+  if (n <= 1) {
+    return(list(ks = 0, branch = NA_character_,
+                le_idx = integer(0), le_full = integer(0),
+                gap = 0, contrib_sum_ok = TRUE))
+  }
+
+  N   <- num_genes
+  pos <- tags_position_sorted
+
+  # a-term deviations at each sorted hit j: j/n - pos[j]/N
+  a_vec <- vapply(seq_len(n),
+                  function(j) j / n - pos[j] / N,
+                  numeric(1))
+  # b-term deviations at each sorted hit j: pos[j]/N - (j-1)/n
+  b_vec <- vapply(seq_len(n),
+                  function(j) pos[j] / N - (j - 1) / n,
+                  numeric(1))
+
+  a_up <- max(a_vec)
+  b_up <- max(b_vec)
+
+  # EXACT same decision as cmap_score_new: ifelse(a > b, a, -b)
+  if (a_up > b_up) {
+    ks      <- a_up
+    branch  <- "a"
+    jstar   <- which.max(a_vec)
+    le_full <- seq_len(jstar)                    # OLD definition (full block)
+
+    # --- Method C on the "a" arm -------------------------------------------
+    # Per-gene contribution c_j = 1/n - (pos[j]-pos[j-1])/N, j = 1..jstar,
+    # with pos[0] := 0. These telescope EXACTLY to a_vec[jstar] = ks.
+    pj   <- pos[seq_len(jstar)]
+    pjm1 <- c(0, pos[seq_len(jstar - 1)])        # pos[0]:=0, then pos[1..jstar-1]
+    contrib <- (1 / n) - (pj - pjm1) / N
+    gap     <- ks
+
+    sel <- select_cumulative(contrib, gap, contrib_frac)
+    le_idx <- sel                                # already in ascending order
+
+  } else {
+    ks      <- -b_up
+    branch  <- "b"
+    jstar   <- which.max(b_vec)
+    le_full <- seq.int(jstar, n)                 
+
+    
+    blk   <- seq.int(jstar, n)
+    pj    <- pos[blk]
+    pjp1  <- c(pos[blk[-1]], N)                  # pos[j+1], with pos[n+1]:=N
+    contrib_desc <- (pjp1 - pj) / N - (1 / n)    # telescopes to -G_b
+    gap_desc     <- sum(contrib_desc)            # == -b_up (negative)
+
+
+    sel <- select_cumulative(-contrib_desc, -gap_desc, contrib_frac)
+    le_idx <- blk[sel]
+    # For the telescoping self-check we report against the true KS magnitude:
+    gap <- ks
+    contrib <- contrib_desc                      # used only for the assert
+  }
+
+
+  contrib_sum_ok <- if (branch == "a") {
+    abs(sum(contrib) - ks) < LE_TELESCOPE_TOL
+  } else {
+    abs(sum(contrib) - (-abs(ks))) < LE_TELESCOPE_TOL   # descent == -|gap|
+  }
+
+  list(ks = ks, branch = branch,
+       le_idx = le_idx, le_full = le_full,
+       gap = ks, contrib_sum_ok = contrib_sum_ok)
+}
+
+# Full scorer mirroring cmap_score_new, but also surfacing leading edges.
+# `drug_signature_df` has columns: ids, rank   (rank already = -1*rank(Value))
+cmap_score_with_le <- function(sig_up_genes, sig_down_genes,
+                                drug_signature_df, gamma = 1,
+                                contrib_frac = LE_CONTRIB_FRAC) {
+  num_genes <- nrow(drug_signature_df)
+
+
+  up_sel  <- drug_signature_df$ids %in% sig_up_genes
+  dn_sel  <- drug_signature_df$ids %in% sig_down_genes
+
+  up_pos_raw  <- drug_signature_df$rank[up_sel]
+  up_ids_raw  <- drug_signature_df$ids[up_sel]
+  dn_pos_raw  <- drug_signature_df$rank[dn_sel]
+  dn_ids_raw  <- drug_signature_df$ids[dn_sel]
+
+  up_ord <- order(up_pos_raw)   # order() == the ordering sort() would apply
+  dn_ord <- order(dn_pos_raw)
+
+  up_pos <- up_pos_raw[up_ord]; up_ids <- up_ids_raw[up_ord]
+  dn_pos <- dn_pos_raw[dn_ord]; dn_ids <- dn_ids_raw[dn_ord]
+
+  num_tags_up   <- length(up_pos)
+  num_tags_down <- length(dn_pos)
+
+  ks_up   <- 0; up_branch <- NA_character_
+  up_le_genes <- character(0); up_full_size <- 0L; up_ok <- TRUE
+  ks_down <- 0; dn_branch <- NA_character_
+  dn_le_genes <- character(0); dn_full_size <- 0L; dn_ok <- TRUE
+
+  if (num_tags_up > 1) {
+    r <- ks_arm_with_leading_edge(up_pos, num_genes, contrib_frac)
+    ks_up        <- r$ks
+    up_branch    <- r$branch
+    up_le_genes  <- up_ids[r$le_idx]
+    up_full_size <- length(r$le_full)
+    up_ok        <- r$contrib_sum_ok
+  }
+
+  if (num_tags_down > 1) {
+    r <- ks_arm_with_leading_edge(dn_pos, num_genes, contrib_frac)
+    ks_down      <- r$ks
+    dn_branch    <- r$branch
+    dn_le_genes  <- dn_ids[r$le_idx]
+    dn_full_size <- length(r$le_full)
+    dn_ok        <- r$contrib_sum_ok
+  }
+
+  # EXACT same combination logic as cmap_score_new
+  if (ks_up == 0 & ks_down != 0) {
+    connectivity_score <- -ks_down
+  } else if (ks_up != 0 & ks_down == 0) {
+    connectivity_score <- gamma * ks_up
+  } else {
+    connectivity_score <- gamma * ks_up - ks_down
+  }
+
+  list(
+    score          = connectivity_score,
+    ks_up          = ks_up,
+    ks_down        = ks_down,
+    up_branch      = up_branch,
+    down_branch    = dn_branch,
+    up_le_genes    = up_le_genes,
+    down_le_genes  = dn_le_genes,
+    up_full_size   = up_full_size,
+    down_full_size = dn_full_size,
+    contrib_ok     = up_ok && dn_ok
+  )
+}
+
+
+
+# -----------------------------------------------------------------------------
+# 3. LOAD MAP & PREP A DRUG-SIGNATURE CACHE
+# -----------------------------------------------------------------------------
+
+# NOTE: the real column header is on line 2 of this file (line 1 is a banner /
+# grouping row), so we skip the first line. If you ever point this at a file
+# whose header is on line 1, set skip = 0.
+map_df <- read_csv(input_map_path, skip = 1, show_col_types = FALSE)
+
+required_cols <- c("Drug_Signature", "Disease_Signature", "Disease_Name",
+                   "perturbation", "Raw_Score", "Up_Genes_Used", "Down_Genes_Used")
+missing_cols <- setdiff(required_cols, names(map_df))
+if (length(missing_cols) > 0) {
+  stop("Map is missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+
+cat(sprintf("Loaded map: %d rows.\n", nrow(map_df)))
+
+drug_cache <- new.env(parent = emptyenv())
+
+get_drug_signature <- function(perturbation, drug_file_name) {
+  cache_key <- paste(perturbation, drug_file_name, sep = "||")
+  if (!is.null(drug_cache[[cache_key]])) return(drug_cache[[cache_key]])
+
+  base_dir <- drug_sig_dirs[[perturbation]]
+  if (is.null(base_dir) || is.na(base_dir)) {
+    drug_cache[[cache_key]] <- NA
+    return(NA)
+  }
+  fpath <- file.path(base_dir, drug_file_name)
+  if (!file.exists(fpath)) {
+    drug_cache[[cache_key]] <- NA
+    return(NA)
+  }
+
+  drug_data <- read_csv(fpath, show_col_types = FALSE)
+  drug_sig <- drug_data %>%
+    filter(!is.na(Human_Ensembl)) %>%
+    group_by(Human_Ensembl) %>%
+    summarize(Value = median(log2FoldChange, na.rm = TRUE), .groups = "drop")
+
+  prepared <- data.frame(
+    ids  = drug_sig$Human_Ensembl,
+    rank = -1 * rank(drug_sig$Value),   # IDENTICAL to original orientation
+    stringsAsFactors = FALSE
+  )
+  drug_cache[[cache_key]] <- prepared
+  prepared
+}
+
+# -----------------------------------------------------------------------------
+# 3b. DISEASE SUBFOLDER RESOLUTION
+# -----------------------------------------------------------------------------
+
+existing_disease_folders <- if (dir.exists(disease_sig_dir)) {
+  list.dirs(disease_sig_dir, full.names = FALSE, recursive = FALSE)
+} else character(0)
+
+derive_disease_folder <- function(disease_file) {
+  sub("_.*$", "", disease_file)
+}
+
+resolve_disease_path <- function(disease_file) {
+  folder <- derive_disease_folder(disease_file)
+  exists_on_disk <- folder %in% existing_disease_folders
+  path <- file.path(disease_sig_dir, folder, disease_file)
+  list(path = path, folder = folder, folder_exists = exists_on_disk)
+}
+
+n <- nrow(map_df)
+
+recomputed_score   <- rep(NA_real_, n)
+score_diff         <- rep(NA_real_, n)
+score_tier         <- rep(NA_character_, n)
+up_count_check     <- rep(NA_character_, n)
+down_count_check   <- rep(NA_character_, n)
+le_up_serialized   <- rep(NA_character_, n)
+le_down_serialized <- rep(NA_character_, n)
+le_up_branch       <- rep(NA_character_, n)
+le_down_branch     <- rep(NA_character_, n)
+le_up_size         <- rep(NA_integer_, n)
+le_down_size       <- rep(NA_integer_, n)
+le_up_full_size    <- rep(NA_integer_, n)   # old full-block size (diagnostic)
+le_down_full_size  <- rep(NA_integer_, n)
+contrib_ok_vec     <- rep(NA, n)            # telescoping self-check
+row_note           <- rep("", n)
+
+classify_tier <- function(d) {
+  if (is.na(d)) return("Unresolved")
+  if (d == 0) return("Exact")
+  if (abs(d) < SCORE_TOL) return("Negligible")
+  "Material"
+}
+
+pb_every <- max(1, floor(n / 50))
+
+for (k in seq_len(n)) {
+  perturbation <- map_df$perturbation[k]
+  drug_file    <- map_df$Drug_Signature[k]
+  disease_name <- map_df$Disease_Name[k]
+  disease_file <- map_df$Disease_Signature[k]
+  stored_score <- map_df$Raw_Score[k]
+
+  drug_signature_df <- get_drug_signature(perturbation, drug_file)
+  if (length(drug_signature_df) == 1 && is.na(drug_signature_df)[1]) {
+    score_tier[k] <- "Unresolved"
+    row_note[k]   <- "drug signature file/dir not found"
+    next
+  }
+  drug_gene_universe <- drug_signature_df$ids
+
+  dz_res  <- resolve_disease_path(disease_file)
+  dz_path <- dz_res$path
+  if (!file.exists(dz_path)) {
+    score_tier[k] <- "Unresolved"
+    row_note[k]   <- if (!dz_res$folder_exists) {
+      sprintf("derived disease folder '%s' not found on disk", dz_res$folder)
+    } else {
+      "disease signature file not found in its folder"
+    }
+    next
+  }
+
+  dz <- read_csv(dz_path, show_col_types = FALSE) %>%
+    filter(identifier %in% drug_gene_universe)
+
+  dz_up   <- dz %>% filter(log2FoldChange >  1 & padj < 0.05)
+  dz_down <- dz %>% filter(log2FoldChange < -1 & padj < 0.05)
+
+  dz_up_genes   <- head(dz_up$identifier,   min(nrow(dz_up),   500))
+  dz_down_genes <- head(dz_down$identifier, min(nrow(dz_down), 500))
+
+  up_len   <- length(dz_up_genes)
+  down_len <- length(dz_down_genes)
+
+  up_count_check[k] <- if (!is.na(map_df$Up_Genes_Used[k]) &&
+                           up_len == map_df$Up_Genes_Used[k]) "match" else "MISMATCH"
+  down_count_check[k] <- if (!is.na(map_df$Down_Genes_Used[k]) &&
+                             down_len == map_df$Down_Genes_Used[k]) "match" else "MISMATCH"
+
+  if (up_len < 10 | down_len < 10) {
+    score_tier[k] <- "Unresolved"
+    row_note[k]   <- sprintf("below-threshold gene counts (up=%d, down=%d)", up_len, down_len)
+    next
+  }
+
+  res <- cmap_score_with_le(dz_up_genes, dz_down_genes, drug_signature_df,
+                            gamma = 1, contrib_frac = LE_CONTRIB_FRAC)
+
+  recomputed_score[k]    <- res$score
+  score_diff[k]          <- res$score - stored_score
+  score_tier[k]          <- classify_tier(score_diff[k])
+  le_up_branch[k]        <- res$up_branch
+  le_down_branch[k]      <- res$down_branch
+  le_up_size[k]          <- length(res$up_le_genes)
+  le_down_size[k]        <- length(res$down_le_genes)
+  le_up_full_size[k]     <- res$up_full_size
+  le_down_full_size[k]   <- res$down_full_size
+  contrib_ok_vec[k]      <- res$contrib_ok
+  le_up_serialized[k]    <- paste(res$up_le_genes,   collapse = LE_DELIM)
+  le_down_serialized[k]  <- paste(res$down_le_genes, collapse = LE_DELIM)
+
+  if (k %% pb_every == 0 || k == n) {
+    cat(sprintf("\r  processed %d / %d rows", k, n)); flush.console()
+  }
+}
+cat("\n")
+
+# -----------------------------------------------------------------------------
+# 5. ASSEMBLE OUTPUT (original columns untouched; new columns appended)
+# -----------------------------------------------------------------------------
+
+out_df <- map_df
+out_df$Recomputed_Raw_Score <- recomputed_score
+out_df$Score_Diff           <- score_diff
+out_df$Score_Tier           <- score_tier
+out_df$Up_Count_Check       <- up_count_check
+out_df$Down_Count_Check     <- down_count_check
+out_df$LeadingEdge_Up       <- le_up_serialized
+out_df$LeadingEdge_Down     <- le_down_serialized
+out_df$LE_Up_Branch         <- le_up_branch
+out_df$LE_Down_Branch       <- le_down_branch
+out_df$LE_Up_Size           <- le_up_size
+out_df$LE_Down_Size         <- le_down_size
+out_df$LE_Up_FullBlock_Size   <- le_up_full_size     # old definition, for ref
+out_df$LE_Down_FullBlock_Size <- le_down_full_size
+out_df$LE_Contrib_Frac        <- LE_CONTRIB_FRAC     # provenance of the cutoff
+out_df$LE_Telescope_OK        <- contrib_ok_vec      # per-row correctness flag
+
+write_csv(out_df, output_map_path)
+
+
+
+
+
+
+
+
+
+# =============================================================================
+# Leading-Edge: Ensembl -> Gene Symbol conversion + final trimmed deliverable
+# -----------------------------------------------------------------------------
+# Reads the augmented table (with Ensembl leading edges + diagnostics),
+# converts each leading-edge gene list from Human_Ensembl to Human_Symbol
+# using the same mapping that built the signatures, and writes a NEW file
+# containing ONLY:
+#   - the 10 original map columns
+#   - LeadingEdge_Up        (Ensembl, existing)
+#   - LeadingEdge_Down      (Ensembl, existing)
+#   - LeadingEdge_Up_Symbols   (new)
+#   - LeadingEdge_Down_Symbols (new)
+#
+# Conversion rules:
+#   * One symbol per Ensembl ID (first non-empty, distinct).
+#   * IDs with no symbol are left as the original Ensembl ID (gene is NOT
+#     dropped), so the symbol list aligns position-for-position with the
+#     Ensembl list and the up/down sets stay complete.
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+
+# -----------------------------------------------------------------------------
+# 0. PATHS
+# -----------------------------------------------------------------------------
+chenlab_root <- "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab"
+fss          <- file.path(chenlab_root, "semaglutide_project/Full_Survey_Semaglutide")
+
+supp_dir <- file.path(fss, "Figures/Supplement/Supplementary_Tables")
+
+input_augmented  <- file.path(supp_dir, "Supplementary_Tables_withLeadingEdge2.csv")
+mapping_file     <- file.path(chenlab_root, "mouse_human_gene_mapping.csv")
+
+final_dir        <- file.path(supp_dir, "LeadingEdge_Final")
+output_final     <- file.path(final_dir, "Supplementary_Tables_LeadingEdge_Final2.csv")
+
+if (!dir.exists(final_dir)) dir.create(final_dir, recursive = TRUE, showWarnings = FALSE)
+
+LE_DELIM <- ";"   # must match the delimiter used in the extraction script
+
+# -----------------------------------------------------------------------------
+# 1. LOAD
+# -----------------------------------------------------------------------------
+df <- read_csv(input_augmented, show_col_types = FALSE)
+
+original_cols <- c("Drug_Signature", "Drug_Tissue", "Disease_Signature",
+                   "Disease_Name", "Disease_Tissue", "Raw_Score",
+                   "Z_Score_Median", "Up_Genes_Used", "Down_Genes_Used",
+                   "perturbation")
+
+stopifnot(all(c(original_cols, "LeadingEdge_Up", "LeadingEdge_Down") %in% names(df)))
+
+# -----------------------------------------------------------------------------
+# 2. BUILD ENSEMBL -> SYMBOL LOOKUP (human), one symbol per Ensembl ID
+# -----------------------------------------------------------------------------
+gene_map <- read_csv(mapping_file, show_col_types = FALSE) %>%
+  dplyr::rename(
+    Human_Ensembl = hsapiens_homolog_ensembl_gene,
+    Human_Symbol  = hsapiens_homolog_associated_gene_name
+  ) %>%
+  dplyr::select(Human_Ensembl, Human_Symbol) %>%
+  dplyr::filter(!is.na(Human_Ensembl), Human_Ensembl != "") %>%
+  dplyr::mutate(Human_Symbol = ifelse(is.na(Human_Symbol) | Human_Symbol == "",
+                                       NA_character_, Human_Symbol)) %>%
+  dplyr::distinct()
+
+# Collapse to one symbol per Ensembl: prefer the first non-NA symbol.
+ens2sym_tbl <- gene_map %>%
+  dplyr::group_by(Human_Ensembl) %>%
+  dplyr::summarise(
+    Human_Symbol = {
+      s <- Human_Symbol[!is.na(Human_Symbol)]
+      if (length(s) == 0) NA_character_ else s[1]
+    },
+    .groups = "drop"
+  )
+
+# Named vector for fast lookup
+ens2sym <- setNames(ens2sym_tbl$Human_Symbol, ens2sym_tbl$Human_Ensembl)
+
+# -----------------------------------------------------------------------------
+# 3. CONVERSION HELPER
+# -----------------------------------------------------------------------------
+# Convert one serialized Ensembl list -> serialized symbol list.
+# Unmapped IDs fall back to the original Ensembl ID (gene not dropped).
+convert_le <- function(ens_string) {
+  if (is.na(ens_string) || ens_string == "") return(ens_string)
+  ids <- strsplit(ens_string, LE_DELIM, fixed = TRUE)[[1]]
+  syms <- ens2sym[ids]
+  # Fallback: where no symbol (NA from lookup, i.e. ID absent or symbol NA),
+  # keep the original Ensembl ID so positions stay aligned and complete.
+  out <- ifelse(is.na(syms), ids, unname(syms))
+  paste(out, collapse = LE_DELIM)
+}
+
+df$LeadingEdge_Up_Symbols   <- vapply(df$LeadingEdge_Up,   convert_le, character(1))
+df$LeadingEdge_Down_Symbols <- vapply(df$LeadingEdge_Down, convert_le, character(1))
+
+# -----------------------------------------------------------------------------
+# 4. CONVERSION DIAGNOSTICS (printed only; not written to the deliverable)
+# -----------------------------------------------------------------------------
+count_unmapped <- function(ens_string) {
+  if (is.na(ens_string) || ens_string == "") return(0L)
+  ids <- strsplit(ens_string, LE_DELIM, fixed = TRUE)[[1]]
+  sum(is.na(ens2sym[ids]))
+}
+total_up_genes   <- sum(vapply(df$LeadingEdge_Up,
+                        function(s) if (is.na(s) || s=="") 0L else length(strsplit(s, LE_DELIM, fixed=TRUE)[[1]]),
+                        integer(1)))
+total_down_genes <- sum(vapply(df$LeadingEdge_Down,
+                        function(s) if (is.na(s) || s=="") 0L else length(strsplit(s, LE_DELIM, fixed=TRUE)[[1]]),
+                        integer(1)))
+unmapped_up   <- sum(vapply(df$LeadingEdge_Up,   count_unmapped, integer(1)))
+unmapped_down <- sum(vapply(df$LeadingEdge_Down, count_unmapped, integer(1)))
+
+cat("---- Ensembl -> Symbol conversion summary ----\n")
+cat(sprintf("Up leading-edge gene slots:   %d total, %d unmapped (%.2f%%) kept as Ensembl\n",
+            total_up_genes, unmapped_up,
+            if (total_up_genes>0) 100*unmapped_up/total_up_genes else 0))
+cat(sprintf("Down leading-edge gene slots: %d total, %d unmapped (%.2f%%) kept as Ensembl\n",
+            total_down_genes, unmapped_down,
+            if (total_down_genes>0) 100*unmapped_down/total_down_genes else 0))
+
+# -----------------------------------------------------------------------------
+# 5. ASSEMBLE FINAL DELIVERABLE (10 original cols + 4 leading-edge cols)
+# -----------------------------------------------------------------------------
+final_df <- df %>%
+  dplyr::select(
+    all_of(original_cols),
+    LeadingEdge_Up,            # Ensembl, up
+    LeadingEdge_Down,          # Ensembl, down
+    LeadingEdge_Up_Symbols,    # Symbols, up
+    LeadingEdge_Down_Symbols   # Symbols, down
+  )
+
+write_csv(final_df, output_final)
+
+cat(sprintf("\nWrote final deliverable (%d rows, %d cols) to:\n  %s\n",
+            nrow(final_df), ncol(final_df), output_final))
+
+
