@@ -1,0 +1,158 @@
+
+
+# --- 1. Load Required Libraries ---
+library(readxl)
+library(dplyr)
+library(stringr)
+library(sigatlas)
+
+# Ensure GSVA is installed
+if (!require("GSVA", quietly = TRUE)) BiocManager::install("GSVA")
+
+# --- 2. Prepare the Expression Matrix ---
+# Assuming 'matrix_lk_linear' and 'matrix_blh_linear' are already in your environment
+
+message("--- Preparing Expression Matrix ---")
+
+# A. Merge the matrices
+common_genes <- intersect(rownames(matrix_lk_linear), rownames(matrix_blh_linear))
+combined_matrix <- cbind(
+  matrix_lk_linear[common_genes, ],
+  matrix_blh_linear[common_genes, ]
+)
+
+# B. Clean Matrix Column Names (The "ZS" Fix)
+colnames(combined_matrix) <- gsub("ZS", "", colnames(combined_matrix))
+cleaned_colnames <- colnames(combined_matrix)
+
+# --- 3. Load and Clean Metadata ---
+message("--- Preparing Metadata ---")
+
+meta_path <- "C:/Documents/science/ChenLab/semaglutide_project/QC REPORT -8-31-25.xlsx"
+metadata_raw <- read_excel(meta_path)
+
+metadata_clean <- metadata_raw %>%
+  dplyr::select(`Sample Name`, Tissue, case_control) %>%
+  filter(!is.na(`Sample Name`)) %>%
+  rename(Sample_ID = `Sample Name`, Condition = case_control)
+
+# Filter and Align Metadata
+final_metadata <- metadata_clean %>%
+  filter(Sample_ID %in% cleaned_colnames)
+
+final_metadata <- final_metadata[match(cleaned_colnames, final_metadata$Sample_ID), ]
+
+if(all(final_metadata$Sample_ID == colnames(combined_matrix))) {
+  message("SUCCESS: Metadata aligned.")
+} else {
+  stop("CRITICAL MISMATCH: Metadata and Matrix do not align.")
+}
+
+# --- 4. THE "TITLE CASE" CONVERSION (Match Matrix to Title Case) ---
+message("--- Converting Matrix to Title Case (Rat -> Mouse Standard) ---")
+
+# Define helper function to convert "GENE" -> "Gene"
+to_title_case <- function(x) {
+  s <- tolower(x)
+  paste0(toupper(substr(s, 1, 1)), substr(s, 2, nchar(s)))
+}
+
+# Convert Matrix Rownames
+mapped_matrix <- combined_matrix
+new_genes <- to_title_case(rownames(mapped_matrix))
+
+# Handle Duplicates (if any arise from conversion)
+if(any(duplicated(new_genes))) {
+  message("Duplicate gene symbols found after standardization. Aggregating by Sum...")
+  mapped_matrix <- rowsum(mapped_matrix, group = new_genes)
+} else {
+  rownames(mapped_matrix) <- new_genes
+}
+
+message(paste("Matrix Converted. Example genes:", paste(head(rownames(mapped_matrix), 3), collapse=", ")))
+
+# --- 5. PARSE CUSTOM MARKERS (Corrected) ---
+message("--- Parsing Custom Markers ---")
+
+# 1. Point to the CSV we created in the previous script
+# (Ensure this path matches where you saved it)
+csv_path <- "C:/Documents/science/ChenLab/semaglutide_project/Full_Survey_Semaglutide/SingleCellDeconvolution/SigatlasCustomRat/processed_marker_database.csv"
+
+if(!file.exists(csv_path)) stop("Could not find the marker CSV file at the specified path.")
+
+# 2. Read the CSV
+marker_db <- read.csv(csv_path, stringsAsFactors = FALSE)
+
+# 3. CRITICAL FIX: Convert Marker Genes to Title Case
+# The CSV has "ACTB", but your matrix now has "Actb". We must match them.
+marker_db$Gene <- to_title_case(marker_db$Gene)
+
+message(paste("Markers loaded and converted to Title Case. Total rows:", nrow(marker_db)))
+
+
+# --- 6. DECONVOLUTION LOOP ---
+tissues_to_run <- unique(marker_db$Tissue)
+
+# Create output folder
+if(!dir.exists("sigatlas_custom_results")) dir.create("sigatlas_custom_results")
+
+for (meta_tissue in tissues_to_run) {
+  message(paste("\nProcessing Tissue:", meta_tissue))
+
+  # A. Filter database for this tissue
+  tis_data <- marker_db[marker_db$Tissue == meta_tissue, ]
+  
+  # B. Convert to List Format for Sigatlas (Gene vector per Cell Type)
+  tissue_gene_list <- split(tis_data$Gene, tis_data$Cell_Type)
+
+  # C. Get Samples from Metadata
+  tis_samples_meta <- final_metadata[final_metadata$Tissue == meta_tissue, ]
+  
+  # Validate we have samples
+  if(nrow(tis_samples_meta) == 0) {
+    message("  > No samples found in metadata for this tissue. Skipping.")
+    next
+  }
+
+  # D. Subset Matrix (Safe Match)
+  # Only take samples that exist in both metadata AND the matrix
+  valid_samples <- intersect(tis_samples_meta$Sample_ID, colnames(mapped_matrix))
+  
+  if(length(valid_samples) == 0) {
+    message("  > Metadata samples not found in Matrix columns. Skipping.")
+    next
+  }
+  
+  sub_matrix <- mapped_matrix[, valid_samples, drop = FALSE]
+
+  # --- CHECK OVERLAP (Debugging Step) ---
+  matrix_genes <- rownames(sub_matrix)
+  marker_genes <- unique(unlist(tissue_gene_list))
+  intersect_genes <- intersect(matrix_genes, marker_genes)
+  
+  overlap_pct <- (length(intersect_genes) / length(marker_genes)) * 100
+  message(paste("  > Matrix Samples:", ncol(sub_matrix)))
+  message(paste("  > Marker Sets:", length(tissue_gene_list)))
+  message(paste("  > Gene Overlap:", round(overlap_pct, 1), "% of marker genes found in matrix."))
+
+  # E. Run Sigatlas
+  tryCatch({
+    scores <- sigatlas(
+      expr = sub_matrix, 
+      tissue = "Null",         
+      organism = "Other",      
+      cellmarker = tissue_gene_list
+    )
+    
+    # Save Results
+    out_file <- paste0("sigatlas_custom_results/sigatlas_", meta_tissue, ".csv")
+    write.csv(scores, out_file)
+    message(paste("  > SUCCESS: Saved to", out_file))
+    
+  }, error = function(e) {
+    message(paste("  > ERROR running sigatlas:", e$message))
+  })
+}
+
+message("\nAll tasks completed.")
+
