@@ -6,8 +6,34 @@ PROJECT_ROOT <- ""
 
 #For this project, rat count files were translated into mice (via biomart) to be inserted into the pipeline here. It was confirmed this standardization step did not affect reversal results, by doing DEseq on the rat counts files, translating directly to human, and running reversal. Therefore, non-mouse counts files may also be inserted into the pipeline in the next script, which functions as a further standardization step that transforms signatures into the format expected for all downstream steps.
 
+#Again, for this project, the counts files were translated via biomart query. It was done with the following settings:
 
-PROJECT_ROOT <- "/Users/palmerzs/Library/CloudStorage/OneDrive-MichiganStateUniversity/ChenLab/semaglutide_project/Full_Survey_Semaglutide"
+
+# Get the orthology map from rat to mouse
+mouse_ortholog_map <- getBM(
+  attributes = c("external_gene_name", "mmusculus_homolog_associated_gene_name"),
+  filters = "external_gene_name",
+  values = rownames(count_data),
+  mart = rat_mart
+)
+
+# Join, filter, summarize, and convert to a final matrix
+final_counts_mouse <- rat_counts_df %>%
+  left_join(mouse_ortholog_map, by = "external_gene_name") %>%
+  filter(mmusculus_homolog_associated_gene_name != "" & !is.na(mmusculus_homolog_associated_gene_name)) %>%
+  group_by(mmusculus_homolog_associated_gene_name) %>%
+  summarise(across(where(is.numeric), median), .groups = "drop") %>%
+  column_to_rownames("mmusculus_homolog_associated_gene_name") %>%
+  as.matrix()
+
+# Save the mouse-translated data
+mouse_rds_path <- file.path(output_dir, "final_counts_mouse.rds")
+mouse_csv_path <- file.path(output_dir, "final_counts_mouse.csv")
+saveRDS(final_counts_mouse, file = mouse_rds_path)
+write.csv(final_counts_mouse, file = mouse_csv_path)
+
+
+#But you can also do DEseq first and translate the signature directly to human for reversal, this does not change results.
 
 suppressPackageStartupMessages({
   library(readr); library(dplyr); library(stringr); library(tibble); library(tidyr)
