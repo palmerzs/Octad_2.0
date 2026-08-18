@@ -2660,7 +2660,6 @@ print(f"\nSaved: {OUTPUT_FILE}")
 Figure 5
 ```{r}
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # BLOCK 0: Preamble — libraries, paths, shared helpers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2753,14 +2752,14 @@ make_fgsea_panel <- function(disease_name, z_score, query, ranked) {
   es_up  <- compute_running_es(query$up,   ranked)
   es_dn  <- compute_running_es(query$down, ranked)
 
-  set.seed(42)
+      set.seed(42)
   res_up <- if (length(query$up) > 0)
-    fgsea(list(UP   = query$up),   ranked, minSize = 1,
-          maxSize = 5000, nPermSimple = 10000) else NULL
+    fgsea(list(UP   = query$up),   ranked, minSize = 1, maxSize = 5000,
+          nPermSimple = 100000, scoreType = "neg") else NULL
   set.seed(42)
   res_dn <- if (length(query$down) > 0)
-    fgsea(list(DOWN = query$down), ranked, minSize = 1,
-          maxSize = 5000, nPermSimple = 10000) else NULL
+    fgsea(list(DOWN = query$down), ranked, minSize = 1, maxSize = 5000,
+          nPermSimple = 100000, scoreType = "pos") else NULL
 
   fmt_stat <- function(res) if (!is.null(res))
     sprintf("NES=%.2f p=%s", round(res$NES[1], 2), signif(res$pval[1], 2)) else "n/a"
@@ -2860,13 +2859,19 @@ print(p_fgsea_3)
 preview_fgsea <- (p_fgsea_1 / p_fgsea_2 / p_fgsea_3) +
   plot_annotation(title = "Block 1 preview — fgsea panels")
 
+# Vector version — infinitely sharp, best for reading the subtitle numbers
+ggsave(
+  filename = file.path(out_dir, "PREVIEW_block1_fgsea.pdf"),
+  plot     = preview_fgsea,
+  width    = 3.5, height = 9, bg = "white"
+)
+
+# Raster version — same layout, 4x the linear resolution
 ggsave(
   filename = file.path(out_dir, "PREVIEW_block1_fgsea.png"),
   plot     = preview_fgsea,
-  width    = 3.5, height = 9, dpi = 150, bg = "white"
+  width    = 3.5, height = 9, dpi = 600, bg = "white"
 )
-
-cat("\nBlock 1 preview saved to:", file.path(out_dir, "PREVIEW_block1_fgsea.png"), "\n")
 
 
 
